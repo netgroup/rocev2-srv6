@@ -1,3 +1,3 @@
 #!/bin/bash
 
-podman build -t pastrami-builder .
+podman build -t rocesrv6-builder .

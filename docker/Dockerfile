@@ -15,6 +15,8 @@ RUN apt-get install -y \
         binutils-dev \
         libcap-dev \
         libelf-dev \
+	universal-ctags \
+	termshark \
         gcc-multilib \
         gpg \
         vim \

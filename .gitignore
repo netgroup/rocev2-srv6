@@ -1,4 +1,3 @@
-/build
-/examples/c/build
-/examples/c/.xmake
-/.idea
+/src/c/.output
+**/*.swp
+tags

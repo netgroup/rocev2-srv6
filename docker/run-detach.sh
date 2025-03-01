@@ -5,6 +5,6 @@ sudo podman run \
 	-d \
 	--replace \
 	--privileged \
-	--name pastrami-builder \
-	-v ../:/opt/pastrami \
-	-it localhost/pastrami-builder
+	--name rocesrv6-builder \
+	-v ../:/opt/rocesrv6 \
+	-it localhost/rocesrv6-builder

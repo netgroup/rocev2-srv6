@@ -3,7 +3,7 @@
 sudo podman run \
 	--rm \
 	--replace \
-	--name pastrami-builder \
-	-v ../:/opt/pastrami \
-	-t localhost/pastrami-builder \
-	bash -c "cd /opt/pastrami && ./init.sh"
+	--name rocesrv6-builder \
+	-v ../:/opt/rocesrv6 \
+	-t localhost/rocesrv6-builder \
+	bash -c "cd /opt/rocesrv6 && ./init.sh"

@@ -3,83 +3,330 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
-#define ETH_P_IP	0x0800 /* Internet Protocol v4 */
-#define ETH_P_IP6	0x86dd /* Internet Protocol v6 */
+#include "common.h"
+#include "parse_helpers.h"
 
-#ifdef DEBUG
-#define BPF_PRINTK_DEBUG(...)		\
-do {					\
-	bpf_printk(__VA_ARGS__);	\
-} while(0)
-#else
-#define BPF_PRINTK_DEBUG(...)		\
-do {					\
-	(void)(1);			\
-} while(0)
+/* define routing acceleration; if set the routing is carried out in XDP/eBPF
+ * context and packet is directly redirect to the egress device; Otherwise, the
+ * packet is passed up to thek kernel stack for further processing.
+*/
+#if 0
+#define ROUTING_ACC
 #endif
 
-#ifndef memcpy
-#define memcpy(dest, src, n)   __builtin_memcpy((dest), (src), (n))
-#endif
-
-#define ETH_ALEN 6
-struct fib_elem {
-	__u32 ifindex;
-	char h_dest[ETH_ALEN];
-	char h_source[ETH_ALEN];
+struct sr6_encap_red_info {
+	struct in6_addr tunsrc;
+	struct in6_addr sid;
 };
+#define SR6_ENCAP_RED_HEADROOM sizeof(struct ipv6hdr)
 
-#define HMAP_MAX_ENTRIES 16
+#define SRH_ENCAPV4_MAX_ENTRIES 256
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, HMAP_MAX_ENTRIES);
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, SRH_ENCAPV4_MAX_ENTRIES);
 	__type(key, __be32);
-	__type(value, struct fib_elem);
-} fibtable SEC(".maps");
+	__type(value, struct sr6_encap_red_info);
+} sr6encap_ip4_table SEC(".maps");
 
-SEC("__xdp_redirect")
-int xdp_redirect(struct xdp_md *ctx)
+static __always_inline
+struct sr6_encap_red_info *encap_policy_lookup_ip4(const struct iphdr *ip4h)
 {
-	void *data_end = (void *)(__u64)ctx->data_end;
-	void *data = (void *)(__u64)ctx->data;
-	struct fib_elem *fe;
-	struct ethhdr *eth;
-	int iif, oif;
+	const __u32 addr = bpf_ntohl(ip4h->daddr);
+
+	return bpf_map_lookup_elem(&sr6encap_ip4_table, &addr);
+}
+
+static __always_inline
+int cur_xdp_expand_head(struct xdp_md *ctx, struct hdr_cursor *cur, int len)
+{
 	int rc;
 
-	BPF_PRINTK_DEBUG("xdp_redirect: xdp_redirect invoked");
-
-	eth = data;
-	if ((void *)(eth + 1) > data_end)
-		return XDP_PASS;
-
-	if (eth->h_proto != bpf_htons(ETH_P_IP6))
-		/* do not process packets which are not IPv6 */
-		return XDP_PASS;
-
-	/* ingress interface */
-	iif = ctx->ingress_ifindex;
-
-	fe = bpf_map_lookup_elem(&fibtable, &iif);
-	if (!fe) {
-		BPF_PRINTK_DEBUG("xdp_redirect: fib for ifname=%d not found", iif);
-		return XDP_PASS;
+	/* expand the xdp frame */
+	rc = cur_xdp_adjust_head(ctx, cur, -len);
+	if (unlikely(rc)) {
+		bpf_printk("cannot expand the xdp frame correctly");
+		return rc;
 	}
 
-	/* egress interface */
-	oif = fe->ifindex;
+	return 0;
+}
 
-	/* fib_elem found */
-	memcpy(eth->h_dest, fe->h_dest, ETH_ALEN);
-	memcpy(eth->h_source, fe->h_source, ETH_ALEN);
+static __always_inline int rebuild_mac_header(struct xdp_md *ctx,
+					      struct hdr_cursor *cur, int len)
+{
+#define get_ethhdr(ctx, cur)						\
+	((struct ethhdr *)cur_header_pointer(ctx, (cur)->mhoff,		\
+					     sizeof(struct ethhdr)))
+	struct ethhdr *old_eth, *eth;
 
-	BPF_PRINTK_DEBUG("xdp_redirect: from iif=%d to oif=%d", iif, oif);
+	old_eth = get_ethhdr(ctx, cur);
+	if (unlikely(!old_eth))
+		goto err;
 
-	rc = bpf_redirect(oif, 0);
-	if (rc != XDP_REDIRECT)
-		BPF_PRINTK_DEBUG("xdp_redirect: bpf_redirect rc=%d", rc);
+	/* set the data pointer to the beginning of expanded xdp frame */
+	__push(cur, len + sizeof(*old_eth));
+	cur_reset_mac_header(cur);
 
-	return rc;
+	eth = get_ethhdr(ctx, cur);
+	if (unlikely(!eth))
+		goto err;
+
+	/* note that the two headers do not overlap each other */
+	memcpy(eth, old_eth, sizeof(*eth));
+	eth->h_proto = bpf_htons(ETH_P_IPV6);
+
+	__pull(cur, sizeof(*eth));
+	cur_reset_network_header(cur);
+
+	return 0;
+
+err:
+	bpf_printk("invalid access to ethernet header");
+	return -EINVAL;
+#undef get_ethhdr
+}
+
+struct ip6_payload_info {
+	struct sr6_encap_red_info *encap_info;
+	__u16 payload_len;
+	__u8 nexthdr;
+	__u8 tos;
+};
+
+#define get_ipv6hdr(ctx, cur)						\
+	((struct ipv6hdr *)cur_header_pointer(ctx, (cur)->nhoff,	\
+					      sizeof(struct ipv6hdr)))
+
+#ifdef ROUTING_ACC
+static __always_inline
+int ipv6_route(struct xdp_md *ctx, struct hdr_cursor *cur, __u32 flags)
+{
+	struct bpf_fib_lookup fib_params;
+	struct in6_addr *saddr, *daddr;
+	struct ipv6hdr *ip6h;
+	struct ethhdr *eth;
+	__be32 flowlabel;
+	int action;
+	int rc;
+
+	memset((void *)&fib_params, 0, sizeof(fib_params));
+
+	ip6h = get_ipv6hdr(ctx, cur);
+	if (unlikely(!ip6h))
+		goto error;
+
+	if (ip6h->hop_limit <= 1)
+		/* we let the kernel decide what to do in this situation */
+		return XDP_PASS;
+
+	saddr = (struct in6_addr *)fib_params.ipv6_src;
+	daddr = (struct in6_addr *)fib_params.ipv6_dst;
+
+	flowlabel = ip6_flowlabel(ip6h);
+
+	*saddr			= ip6h->saddr;
+	*daddr			= ip6h->daddr;
+	fib_params.family	= AF_INET6;
+	fib_params.flowinfo	= flowlabel;
+	fib_params.tot_len	= bpf_ntohs(ip6h->payload_len);
+	fib_params.l4_protocol	= ip6h->nexthdr;
+	fib_params.sport	= 0;
+	fib_params.dport	= 0;
+	fib_params.ifindex	= ctx->ingress_ifindex;
+
+	rc = bpf_fib_lookup(ctx, &fib_params, sizeof(fib_params), flags);
+	switch (rc) {
+	case BPF_FIB_LKUP_RET_SUCCESS:
+		/* lookup successful */
+
+		/* decrease the hop-limit and prepare the ethernet layer
+		 * for submitting the frame.
+		 */
+		ip6h->hop_limit--;
+
+		eth = cur_header_pointer(ctx, cur->mhoff, sizeof(*eth));
+		if (unlikely(!eth))
+			goto error;
+
+		memcpy(eth->h_dest, fib_params.dmac, ETH_ALEN);
+		memcpy(eth->h_source, fib_params.smac, ETH_ALEN);
+
+		action = bpf_redirect(fib_params.ifindex, 0);
+		break;
+
+	case BPF_FIB_LKUP_RET_BLACKHOLE:    /* dest is blackholed; can be dropped */
+	case BPF_FIB_LKUP_RET_UNREACHABLE:  /* dest is unreachable; can be dropped */
+	case BPF_FIB_LKUP_RET_PROHIBIT:     /* dest not allowed; can be dropped */
+		action = XDP_DROP;
+		break;
+
+	case BPF_FIB_LKUP_RET_NOT_FWDED:    /* packet is not forwarded */
+	case BPF_FIB_LKUP_RET_FWD_DISABLED: /* fwding is not enabled on ingress */
+	case BPF_FIB_LKUP_RET_UNSUPP_LWT:   /* fwd requires encapsulation */
+	case BPF_FIB_LKUP_RET_NO_NEIGH:     /* no neighbor entry for nh */
+	case BPF_FIB_LKUP_RET_FRAG_NEEDED:  /* fragmentation required to fwd */
+		action = XDP_PASS;
+		break;
+	}
+
+	return action;
+
+error:
+	return XDP_ABORTED;
+}
+#endif
+
+static __always_inline
+int ip6_packet_forward(struct xdp_md *ctx, struct hdr_cursor *cur, __u32 flags)
+{
+#ifdef ROUTING_ACC
+	/* route the packet within XDP context */
+	return ipv6_route(ctx, cur, flags);
+#else
+	/* pass the packet up to the kernel stack */
+	return XDP_PASS;
+#endif
+}
+
+static __always_inline
+void ipv6hdr_push_encap_red(struct ipv6hdr *ip6h,
+			    const struct sr6_encap_red_info *einfo)
+{
+	memcpy(&ip6h->saddr, &einfo->tunsrc, sizeof(einfo->tunsrc));
+	memcpy(&ip6h->daddr, &einfo->sid, sizeof(einfo->sid));
+}
+
+static __always_inline
+int build_ipv6hdr(struct xdp_md *ctx, struct hdr_cursor *cur,
+		  struct ip6_payload_info *pinfo)
+{
+	const struct sr6_encap_red_info *einfo = pinfo->encap_info;
+	struct ipv6hdr *ip6h;
+
+	ip6h = get_ipv6hdr(ctx, cur);
+	if (unlikely(!ip6h)) {
+		bpf_printk("invalid access to ipv6 header");
+		return -EINVAL;
+	}
+
+	/* ipv4 tos is copied into IPv6 traffic class */
+	ip6_flow_hdr(ip6h, pinfo->tos, 0);
+
+	ip6h->nexthdr = pinfo->nexthdr;
+	ip6h->hop_limit = 64;
+	ip6h->payload_len = bpf_htons(pinfo->payload_len);
+
+	/* move the transport header cursor to the end of IPv6 header */
+	__cur_set_header_off(cur, thoff, cur->nhoff + SR6_ENCAP_RED_HEADROOM);
+
+	ipv6hdr_push_encap_red(ip6h, einfo);
+
+	return 0;
+}
+
+/* NOTE: ATM we support only 1 sid in the encap policy */
+static __always_inline
+int do_srh_encap_red_ip4_core(struct xdp_md *ctx, struct hdr_cursor *cur,
+			      struct iphdr *ip4h)
+{
+	const __u16 encap_len = SR6_ENCAP_RED_HEADROOM;
+	struct ip6_payload_info payload_info = { 0, };
+	struct sr6_encap_red_info *einfo;
+	int rc;
+
+	/* lookup for the IPv4 DA in the encap policy table */
+	einfo = encap_policy_lookup_ip4(ip4h);
+	if (!einfo)
+		/* policy not found */
+		return XDP_PASS;
+
+	/* collect all the data for proceeding with encap */
+	payload_info.payload_len = bpf_ntohs(ip4h->tot_len);
+	payload_info.nexthdr = IPPROTO_IPIP;
+	payload_info.tos = ip4h->tos;
+
+	payload_info.encap_info = einfo;
+
+	/* expand the xdp frame. Note that xdp frame pointers will be
+	 * invalidated after this operation.
+	 */
+	rc = cur_xdp_expand_head(ctx, cur, encap_len);
+	if (unlikely(rc))
+		goto abort;
+
+	/* rebuild the mac header considering the encap overhead */
+	rc = rebuild_mac_header(ctx, cur, encap_len);
+	if (unlikely(rc))
+		goto abort;
+
+	/* build the ipv6 header with encap */
+	rc = build_ipv6hdr(ctx, cur, &payload_info);
+	if (unlikely(rc))
+		goto abort;
+
+	/* forward the packet doing routing lookup */
+	return ip6_packet_forward(ctx, cur, 0);
+
+abort:
+	return XDP_ABORTED;
+}
+
+static __always_inline
+int do_srh_encap_ip4(struct xdp_md *ctx, struct hdr_cursor *cur)
+{
+	struct iphdr *ip4h;
+	__u8  hdr_len;
+	int nexthdr;
+
+	nexthdr = parse_ip4hdr(ctx, cur, &ip4h);
+	if (unlikely(nexthdr < 0))
+		/* if we are in trouble... pass the packet to the kernel :-) */
+		return XDP_PASS;
+
+	/* IPv4 has been processed;
+	 * cur->dataoff points to the end of IPv4 header and we update the
+	 * transport header offset accordingly.
+	 */
+	cur_reset_transport_header(cur);
+
+	/* as parse_ip4hdr consumed the IPv4 header, we move backt the dataoff;
+	 * aligned to network header offset.
+	 */
+	hdr_len = ip4_header_len(ip4h);
+	__push(cur, hdr_len);
+
+	return do_srh_encap_red_ip4_core(ctx, cur, ip4h);
+}
+
+SEC("__xdp_sr6encap")
+int xdp_sr6encap(struct xdp_md *ctx)
+{
+	struct hdr_cursor _cur, *const cur = &_cur;
+	struct ethhdr *eth;
+	__be16 eth_type;
+	__u16 proto;
+
+	/* init the header cursor helper structure used for tracking parsed
+	 * protocols while packet gets processed.
+	 */
+	cur_init(cur);
+	cur_reset_mac_header(cur);
+
+	eth_type = parse_ethhdr(ctx, cur, &eth);
+	if (unlikely(!eth || eth_type < 0))
+		goto pass;
+
+	cur_reset_network_header(cur);
+
+	proto = bpf_ntohs(eth_type);
+	if (proto != ETH_P_IP)
+		/* ATM we are only processing IPv4 traffic */
+		goto pass;
+
+	return do_srh_encap_ip4(ctx, cur);
+
+pass:
+	return XDP_PASS;
 }
 
 SEC("__xdp_pass")

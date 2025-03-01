@@ -16,5 +16,5 @@ It is possibile run the container (in detached mode):
 
 To enter into the container:
 ```bash
-# podman exec -it pastrami-builder bash
+# podman exec -it rocesrv6-builder bash
 ```
