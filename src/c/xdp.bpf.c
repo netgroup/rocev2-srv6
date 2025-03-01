@@ -20,6 +20,10 @@ struct sr6_encap_red_info {
 };
 #define SR6_ENCAP_RED_HEADROOM sizeof(struct ipv6hdr)
 
+struct sr6_decap_info {
+	__u64 reserved;
+};
+
 #define SRH_ENCAPV4_MAX_ENTRIES 256
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -27,6 +31,14 @@ struct {
 	__type(key, __be32);
 	__type(value, struct sr6_encap_red_info);
 } sr6encap_ip4_table SEC(".maps");
+
+#define SRH_DECAP_MAX_ENTRIES	256
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, SRH_DECAP_MAX_ENTRIES);
+	__type(key, struct in6_addr);
+	__type(value, struct sr6_decap_info);
+} sr6decap_table SEC(".maps");
 
 static __always_inline
 struct sr6_encap_red_info *encap_policy_lookup_ip4(const struct iphdr *ip4h)
@@ -51,8 +63,31 @@ int cur_xdp_expand_head(struct xdp_md *ctx, struct hdr_cursor *cur, int len)
 	return 0;
 }
 
+static __always_inline
+int cur_xdp_shrink_head(struct xdp_md *ctx, struct hdr_cursor *cur, int len)
+{
+	int rc;
+
+	/* shrink the xdp frame */
+	rc = cur_xdp_adjust_head(ctx, cur, len);
+	if (unlikely(rc)) {
+		bpf_printk("cannot shrink the xdp frame correctly");
+		return rc;
+	}
+
+	return 0;
+}
+
+static __always_inline int vlan_check(struct hdr_cursor *cur)
+{
+	int maclen = cur->nhoff - cur->mhoff;
+
+	return (maclen == sizeof(struct ethhdr)) ? 0 : -EOPNOTSUPP;
+}
+
 static __always_inline int rebuild_mac_header(struct xdp_md *ctx,
-					      struct hdr_cursor *cur, int len)
+					      struct hdr_cursor *cur, int len,
+					      __u16 proto)
 {
 #define get_ethhdr(ctx, cur)						\
 	((struct ethhdr *)cur_header_pointer(ctx, (cur)->mhoff,		\
@@ -64,7 +99,7 @@ static __always_inline int rebuild_mac_header(struct xdp_md *ctx,
 		goto err;
 
 	/* set the data pointer to the beginning of expanded xdp frame */
-	__push(cur, len + sizeof(*old_eth));
+	__push(cur, len);
 	cur_reset_mac_header(cur);
 
 	eth = get_ethhdr(ctx, cur);
@@ -73,10 +108,9 @@ static __always_inline int rebuild_mac_header(struct xdp_md *ctx,
 
 	/* note that the two headers do not overlap each other */
 	memcpy(eth, old_eth, sizeof(*eth));
-	eth->h_proto = bpf_htons(ETH_P_IPV6);
+	eth->h_proto = bpf_htons(proto);
 
 	__pull(cur, sizeof(*eth));
-	cur_reset_network_header(cur);
 
 	return 0;
 
@@ -255,9 +289,12 @@ int do_srh_encap_red_ip4_core(struct xdp_md *ctx, struct hdr_cursor *cur,
 		goto abort;
 
 	/* rebuild the mac header considering the encap overhead */
-	rc = rebuild_mac_header(ctx, cur, encap_len);
+	rc = rebuild_mac_header(ctx, cur, encap_len + sizeof(struct ethhdr),
+				ETH_P_IPV6);
 	if (unlikely(rc))
 		goto abort;
+
+	cur_reset_network_header(cur);
 
 	/* build the ipv6 header with encap */
 	rc = build_ipv6hdr(ctx, cur, &payload_info);
@@ -324,6 +361,158 @@ int xdp_sr6encap(struct xdp_md *ctx)
 		goto pass;
 
 	return do_srh_encap_ip4(ctx, cur);
+
+pass:
+	return XDP_PASS;
+}
+
+static __always_inline int sr6_decap_sid_lookup(const struct in6_addr *sid)
+{
+	return bpf_map_lookup_elem(&sr6decap_table, sid) ? 0 : -ENOENT;
+}
+
+static __always_inline
+int process_decap_ip4(struct xdp_md *ctx, struct hdr_cursor *cur, __u8 tclass)
+{
+	struct iphdr *ip4h;
+	int nexthdr;
+
+	nexthdr = parse_ip4hdr(ctx, cur, &ip4h);
+	if (unlikely(nexthdr < 0))
+		/* if we are in trouble... pass the packet to the kernel :-) */
+		return XDP_PASS;
+
+	cur_reset_transport_header(cur);
+
+	/* update the IPvv4 TOS field */
+	ipv4_change_dsfield(ip4h, 0xff, tclass);
+
+	return XDP_PASS;
+}
+
+static __always_inline
+int do_srh_decap_ip4_core(struct xdp_md *ctx, struct hdr_cursor *cur,
+			  struct ipv6hdr *ip6h)
+{
+	const struct in6_addr *da = &ip6h->daddr;
+	int shrinklen;
+	__u8 tclass;
+	int rc;
+
+	/* check whether the currend IPv6 DA is bound to a decap SID */
+	rc = sr6_decap_sid_lookup(da);
+	if (rc) {
+		if (likely(rc == -ENOENT))
+			/* No decap SID found */
+			return XDP_PASS;
+
+		goto abort;
+	}
+
+	tclass = ipv6_get_dsfield(ip6h);
+
+	/* dataoff and thoff are aligned at this point */
+	shrinklen = cur->dataoff - sizeof(struct ethhdr);
+	if (unlikely(shrinklen < 0)) {
+		bpf_printk("invalid size for xdp frame shrink operation");
+		goto abort;
+	}
+
+	/* set nhoff aligned with dataoff/thoff */
+	cur_reset_network_header(cur);
+
+	/* mhoff maclen   dataoff = nhoff = thoff
+	 * |.....|       /
+	 * v     v      v
+	 * +-----+------+-------+-----+
+	 * | MAC | IPv6 | IPv4  | ... |
+	 * +-----+------+-------+-----+
+	 *        \____/
+	 *          |
+	 *     to shrink
+	 */
+
+	/* rebuild the mac header considering the encap overhead */
+	rc = rebuild_mac_header(ctx, cur, sizeof(struct ethhdr), ETH_P_IP);
+	if (unlikely(rc))
+		goto abort;
+
+	/* 0     mhoff     dataoff = nhoff = thoff
+	 * |      |      /
+	 * v      v     v
+	 * +------+-----+-------+-----+
+	 * | xxxx | MAC | IPv4  | ... |
+	 * +------+-----+-------+-----+
+	 *  \____/
+	 *    |
+	 *   to be removed as the packet gets shrunk
+	 */
+
+	rc = cur_xdp_shrink_head(ctx, cur, shrinklen);
+	if (unlikely(rc))
+		goto abort;
+
+	return process_decap_ip4(ctx, cur, tclass);
+
+abort:
+	return XDP_ABORTED;
+}
+
+static __always_inline
+int do_srh_decap_ip4(struct xdp_md *ctx, struct hdr_cursor *cur)
+{
+	struct ipv6hdr *ip6h;
+	int nexthdr;
+
+	nexthdr = parse_ip6hdr(ctx, cur, &ip6h);
+	if (unlikely(nexthdr < 0))
+		/* if we are in trouble... pass the packet to the kernel :-) */
+		goto pass;
+
+	/* let's check the nexthdr type; ATM we only support IPv4 directly
+	 * encapsulated.
+	 */
+	if (nexthdr != IPPROTO_IPIP)
+		goto pass;
+
+	/* transport header offset now points to IPv4 header */
+	cur_reset_transport_header(cur);
+
+	return do_srh_decap_ip4_core(ctx, cur, ip6h);
+
+pass:
+	return XDP_PASS;
+}
+
+SEC("__xdp_sr6decap")
+int xdp_sr6decap(struct xdp_md *ctx)
+{
+	struct hdr_cursor _cur, *const cur = &_cur;
+	struct ethhdr *eth;
+	int eth_type;
+	__u16 proto;
+
+	/* init the header cursor helper structure used for tracking parsed
+	 * protocols while packet gets processed.
+	 */
+	cur_init(cur);
+	cur_reset_mac_header(cur);
+
+	eth_type = parse_ethhdr(ctx, cur, &eth);
+	if (unlikely(eth_type < 0))
+		goto pass;
+
+	cur_reset_network_header(cur);
+
+	if (vlan_check(cur))
+		/* VLAn is not supported yet */
+		goto pass;
+
+	proto = bpf_ntohs((__be16)eth_type);
+	if (proto != ETH_P_IPV6)
+		goto pass;
+
+	return do_srh_decap_ip4(ctx, cur);
 
 pass:
 	return XDP_PASS;

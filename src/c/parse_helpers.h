@@ -40,6 +40,32 @@
 
 #define NEXTHDR_MAX		255
 
+/* @see
+ * https://elixir.bootlin.com/linux/v6.13.4/source/include/net/dsfield.h#L22
+ */
+static __always_inline
+void ipv4_change_dsfield(struct iphdr *iph,__u8 mask, __u8 value)
+{
+        __u32 check = bpf_ntohs((__be16)iph->check);
+	__u8 dsfield = (iph->tos & mask) | value;
+
+	check += iph->tos;
+	if ((check + 1) >> 16)
+		check = (check + 1) & 0xffff;
+
+	check -= dsfield;
+	 /* adjust carry */
+	check += check >> 16;
+
+	iph->check = (__be16)bpf_htons(check);
+	iph->tos = dsfield;
+}
+
+static __always_inline  __u8 ipv4_get_dsfield(const struct iphdr *iph)
+{
+	return iph->tos;
+}
+
 #define IPV6_FLOWLABEL_MASK	bpf_htonl(0x0FFFFFFF)
 static inline __be32 ip6_flowlabel(const struct ipv6hdr *hdr)
 {

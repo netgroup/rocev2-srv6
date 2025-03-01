@@ -95,14 +95,14 @@ if [ "$DEBUG" == "on" ]; then
 	# SRv6 microSID Decap (for DEBUG only)
 	ip netns exec $NODE ip -6 route add fc01:0:0512::/128 \
 		encap seg6local action End.DX4 nh4 0.0.0.0 dev veth1
-else
-	# SRv6 microSID Decap
-	ip netns exec $NODE ip -6 route add fc01:0:0512::/128 \
-		encap seg6local action End.DX4 nh4 0.0.0.0 dev veth1
 fi
 
 # Forward Routing
 ip netns exec $NODE ip -6 route add fc00:0::/32 via fd00:0:1::2 dev veth2
+
+# ip6tables rule to mark ECT+CE traffic
+ip netns exec $NODE ip6tables \
+	-t mangle -A POSTROUTING -d fc00:0:512:: -j TOS --set-tos 0x03/0xff
 
 set +e
 read -r -d '' r0_env <<-EOF
@@ -121,8 +121,19 @@ read -r -d '' r0_env <<-EOF
 
 	# required otherwise redirect (on the other peer) for veth won't work
 	${BPFTOOL} net attach xdpdrv \
-		pinned "${BPFFS_PATH}/progs/xdp_pass" \
+		pinned "${BPFFS_PATH}/progs/xdp_sr6decap" \
 		dev veth2
+
+	# decap SID (in bytes)
+	# key:
+	# 	0-15:	SID 				(fc01:0:0512::)
+	# value:
+	# 	0-7:	reserved
+	${BPFTOOL} \
+		map update \
+		pinned "${BPFFS_PATH}/maps/sr6decap_table"			\
+	        key hex         fc 01 00 00 05 12 00 00 00 00 00 00 00 00 00 00 \
+	        value hex       00 00 00 00 00 00 00 00
 
 	${BPFTOOL} net attach xdpdrv \
 		pinned "${BPFFS_PATH}/progs/xdp_sr6encap" \
@@ -173,10 +184,6 @@ if [ "$DEBUG" == "on" ]; then
 	# SRv6 microSID Decap (for DEBUG only)
 	ip netns exec $NODE ip -6 route add fc00:0:0512::/128 \
 		encap seg6local action End.DX4 nh4 0.0.0.0 dev veth3
-else
-	# SRv6 microSID Decap
-	ip netns exec $NODE ip -6 route add fc00:0:0512::/128 \
-		encap seg6local action End.DX4 nh4 0.0.0.0 dev veth3
 fi
 
 # Reverse Routing
@@ -197,10 +204,20 @@ read -r -d '' r1_env <<-EOF
 		pinmaps /sys/fs/bpf/maps \
 		type xdp
 
-	# required otherwise redirect (on the other peer) for veth won't work
 	${BPFTOOL} net attach xdpdrv \
-		pinned "${BPFFS_PATH}/progs/xdp_pass" \
+		pinned "${BPFFS_PATH}/progs/xdp_sr6decap" \
 		dev veth3
+
+	# decap SID (in bytes)
+	# key:
+	# 	0-15:	SID 				(fc00:0:0512::)
+	# value:
+	# 	0-7:	reserved
+	${BPFTOOL} \
+		map update \
+		pinned "${BPFFS_PATH}/maps/sr6decap_table"			\
+	        key hex         fc 00 00 00 05 12 00 00 00 00 00 00 00 00 00 00 \
+	        value hex       00 00 00 00 00 00 00 00
 
 	${BPFTOOL} net attach xdpdrv \
 		pinned "${BPFFS_PATH}/progs/xdp_sr6encap" \
@@ -210,8 +227,8 @@ read -r -d '' r1_env <<-EOF
 	# key:
 	# 	0-3:	ipv4 dst address		(10.0.1.1)
 	# value:
-	# 	0-7:	ipv6 Source tunnel address	(fd00:0:1::2)
-	# 	8-15:	ipv6 Destination uSID carrier	(fc01:0:0512::)
+	# 	0-15:	ipv6 Source tunnel address	(fd00:0:1::2)
+	# 	16-31:	ipv6 Destination uSID carrier	(fc01:0:0512::)
 	${BPFTOOL} \
 		map update \
 		pinned "${BPFFS_PATH}/maps/sr6encap_ip4_table"			\
