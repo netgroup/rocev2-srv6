@@ -340,7 +340,7 @@ int xdp_sr6encap(struct xdp_md *ctx)
 {
 	struct hdr_cursor _cur, *const cur = &_cur;
 	struct ethhdr *eth;
-	__be16 eth_type;
+	int eth_type;
 	__u16 proto;
 
 	/* init the header cursor helper structure used for tracking parsed
@@ -350,12 +350,12 @@ int xdp_sr6encap(struct xdp_md *ctx)
 	cur_reset_mac_header(cur);
 
 	eth_type = parse_ethhdr(ctx, cur, &eth);
-	if (unlikely(!eth || eth_type < 0))
+	if (unlikely(eth_type < 0))
 		goto pass;
 
 	cur_reset_network_header(cur);
 
-	proto = bpf_ntohs(eth_type);
+	proto = bpf_ntohs((__be16)eth_type);
 	if (proto != ETH_P_IP)
 		/* ATM we are only processing IPv4 traffic */
 		goto pass;
