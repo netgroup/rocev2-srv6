@@ -49,14 +49,13 @@ struct sr6_encap_red_info *encap_policy_lookup_ip4(const struct iphdr *ip4h)
 }
 
 static __always_inline
-int cur_xdp_expand_head(struct xdp_md *ctx, struct hdr_cursor *cur, int len)
+int cur_xdp_shrink_head(struct xdp_md *ctx, struct hdr_cursor *cur, int len)
 {
 	int rc;
 
-	/* expand the xdp frame */
-	rc = cur_xdp_adjust_head(ctx, cur, -len);
+	rc = cur_xdp_adjust_head(ctx, cur, len);
 	if (unlikely(rc)) {
-		bpf_printk("cannot expand the xdp frame correctly");
+		bpf_printk("cannot resize (%d) the xdp frame correctly", len);
 		return rc;
 	}
 
@@ -64,19 +63,11 @@ int cur_xdp_expand_head(struct xdp_md *ctx, struct hdr_cursor *cur, int len)
 }
 
 static __always_inline
-int cur_xdp_shrink_head(struct xdp_md *ctx, struct hdr_cursor *cur, int len)
+int cur_xdp_expand_head(struct xdp_md *ctx, struct hdr_cursor *cur, int len)
 {
-	int rc;
-
-	/* shrink the xdp frame */
-	rc = cur_xdp_adjust_head(ctx, cur, len);
-	if (unlikely(rc)) {
-		bpf_printk("cannot shrink the xdp frame correctly");
-		return rc;
-	}
-
-	return 0;
+	return cur_xdp_shrink_head(ctx, cur, -len);
 }
+
 
 static __always_inline int vlan_check(struct hdr_cursor *cur)
 {
