@@ -338,7 +338,7 @@ int do_srh_encap_ip4(struct xdp_md *ctx, struct hdr_cursor *cur)
 	 */
 	cur_reset_transport_header(cur);
 
-	/* as parse_ip4hdr consumed the IPv4 header, we move backt the dataoff;
+	/* as parse_ip4hdr consumed the IPv4 header, we move back the dataoff;
 	 * aligned to network header offset.
 	 */
 	hdr_len = ip4_header_len(ip4h);
