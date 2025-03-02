@@ -123,18 +123,71 @@ struct ip6_payload_info {
 					      sizeof(struct ipv6hdr)))
 
 #ifdef ROUTING_ACC
+struct fib_res_lookup {
+	struct bpf_fib_lookup fib_params;
+	__u32 flags;
+	int action;
+};
+
+static __always_inline
+int fib_lookup(struct xdp_md *ctx, struct hdr_cursor *cur,
+	       struct fib_res_lookup *res)
+{
+	struct bpf_fib_lookup *fib_params = &res->fib_params;
+	int *action = &res->action;
+	__u32 flags = res->flags;
+	struct ethhdr *eth;
+	int rc;
+
+	rc = bpf_fib_lookup(ctx, fib_params, sizeof(*fib_params), flags);
+	switch (rc) {
+	case BPF_FIB_LKUP_RET_SUCCESS:
+		/* lookup successful */
+		eth = cur_header_pointer(ctx, cur->mhoff, sizeof(*eth));
+		if (unlikely(!eth)) {
+			*action = XDP_ABORTED;
+			return -EINVAL;
+		}
+
+		memcpy(eth->h_dest, fib_params->dmac, ETH_ALEN);
+		memcpy(eth->h_source, fib_params->smac, ETH_ALEN);
+
+		*action = bpf_redirect(fib_params->ifindex, 0);
+		break;
+
+	case BPF_FIB_LKUP_RET_BLACKHOLE:    /* dest is blackholed; can be dropped */
+	case BPF_FIB_LKUP_RET_UNREACHABLE:  /* dest is unreachable; can be dropped */
+	case BPF_FIB_LKUP_RET_PROHIBIT:     /* dest not allowed; can be dropped */
+		*action = XDP_DROP;
+		break;
+
+	case BPF_FIB_LKUP_RET_NOT_FWDED:    /* packet is not forwarded */
+	case BPF_FIB_LKUP_RET_FWD_DISABLED: /* fwding is not enabled on ingress */
+	case BPF_FIB_LKUP_RET_UNSUPP_LWT:   /* fwd requires encapsulation */
+	case BPF_FIB_LKUP_RET_NO_NEIGH:     /* no neighbor entry for nh */
+	case BPF_FIB_LKUP_RET_FRAG_NEEDED:  /* fragmentation required to fwd */
+		*action = XDP_PASS;
+		break;
+	}
+
+	return rc;
+}
+
 static __always_inline
 int ipv6_route(struct xdp_md *ctx, struct hdr_cursor *cur, __u32 flags)
 {
-	struct bpf_fib_lookup fib_params;
+	struct fib_res_lookup res = {
+		.flags = 0,
+		.action = XDP_ABORTED,
+	};
+	struct bpf_fib_lookup *fib_params = &res.fib_params;
 	struct in6_addr *saddr, *daddr;
+	int *action = &res.action;
 	struct ipv6hdr *ip6h;
-	struct ethhdr *eth;
 	__be32 flowlabel;
-	int action;
 	int rc;
 
-	memset((void *)&fib_params, 0, sizeof(fib_params));
+	memset((void *)fib_params, 0, sizeof(*fib_params));
 
 	ip6h = get_ipv6hdr(ctx, cur);
 	if (unlikely(!ip6h))
@@ -144,57 +197,33 @@ int ipv6_route(struct xdp_md *ctx, struct hdr_cursor *cur, __u32 flags)
 		/* we let the kernel decide what to do in this situation */
 		return XDP_PASS;
 
-	saddr = (struct in6_addr *)fib_params.ipv6_src;
-	daddr = (struct in6_addr *)fib_params.ipv6_dst;
+	saddr = (struct in6_addr *)fib_params->ipv6_src;
+	daddr = (struct in6_addr *)fib_params->ipv6_dst;
 
 	flowlabel = ip6_flowlabel(ip6h);
 
 	*saddr			= ip6h->saddr;
 	*daddr			= ip6h->daddr;
-	fib_params.family	= AF_INET6;
-	fib_params.flowinfo	= flowlabel;
-	fib_params.tot_len	= bpf_ntohs(ip6h->payload_len);
-	fib_params.l4_protocol	= ip6h->nexthdr;
-	fib_params.sport	= 0;
-	fib_params.dport	= 0;
-	fib_params.ifindex	= ctx->ingress_ifindex;
+	fib_params->family	= AF_INET6;
+	fib_params->flowinfo	= flowlabel;
+	fib_params->tot_len	= bpf_ntohs(ip6h->payload_len);
+	fib_params->l4_protocol	= ip6h->nexthdr;
+	fib_params->sport	= 0;
+	fib_params->dport	= 0;
+	fib_params->ifindex	= ctx->ingress_ifindex;
 
-	rc = bpf_fib_lookup(ctx, &fib_params, sizeof(fib_params), flags);
-	switch (rc) {
-	case BPF_FIB_LKUP_RET_SUCCESS:
-		/* lookup successful */
+	rc = fib_lookup(ctx, cur, &res);
+	if (unlikely(rc < 0))
+		goto error;
+	if (rc != BPF_FIB_LKUP_RET_SUCCESS)
+		goto out;
 
-		/* decrease the hop-limit and prepare the ethernet layer
-		 * for submitting the frame.
-		 */
-		ip6h->hop_limit--;
-
-		eth = cur_header_pointer(ctx, cur->mhoff, sizeof(*eth));
-		if (unlikely(!eth))
-			goto error;
-
-		memcpy(eth->h_dest, fib_params.dmac, ETH_ALEN);
-		memcpy(eth->h_source, fib_params.smac, ETH_ALEN);
-
-		action = bpf_redirect(fib_params.ifindex, 0);
-		break;
-
-	case BPF_FIB_LKUP_RET_BLACKHOLE:    /* dest is blackholed; can be dropped */
-	case BPF_FIB_LKUP_RET_UNREACHABLE:  /* dest is unreachable; can be dropped */
-	case BPF_FIB_LKUP_RET_PROHIBIT:     /* dest not allowed; can be dropped */
-		action = XDP_DROP;
-		break;
-
-	case BPF_FIB_LKUP_RET_NOT_FWDED:    /* packet is not forwarded */
-	case BPF_FIB_LKUP_RET_FWD_DISABLED: /* fwding is not enabled on ingress */
-	case BPF_FIB_LKUP_RET_UNSUPP_LWT:   /* fwd requires encapsulation */
-	case BPF_FIB_LKUP_RET_NO_NEIGH:     /* no neighbor entry for nh */
-	case BPF_FIB_LKUP_RET_FRAG_NEEDED:  /* fragmentation required to fwd */
-		action = XDP_PASS;
-		break;
-	}
-
-	return action;
+	/* decrease the hop-limit and prepare the ethernet layer
+	 * for submitting the frame.
+	 */
+	ip6h->hop_limit--;
+out:
+	return *action;
 
 error:
 	return XDP_ABORTED;
