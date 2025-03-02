@@ -112,6 +112,10 @@ struct ip6_payload_info {
 	__u8 tos;
 };
 
+#define get_ipv4hdr(ctx, cur)						\
+	((struct iphdr *)cur_header_pointer(ctx, (cur)->nhoff,		\
+					    sizeof(struct iphdr)))
+
 #define get_ipv6hdr(ctx, cur)						\
 	((struct ipv6hdr *)cur_header_pointer(ctx, (cur)->nhoff,	\
 					      sizeof(struct ipv6hdr)))
@@ -172,44 +176,70 @@ int fib_lookup(struct xdp_md *ctx, struct hdr_cursor *cur,
 }
 
 static __always_inline
-int ipv6_route(struct xdp_md *ctx, struct hdr_cursor *cur, __u32 flags)
+int xdp_fwd(struct xdp_md *ctx, struct hdr_cursor *cur, __u32 flags,
+	    __u16 proto)
 {
 	struct fib_res_lookup res = {
 		.flags = 0,
 		.action = XDP_ABORTED,
 	};
 	struct bpf_fib_lookup *fib_params = &res.fib_params;
-	struct in6_addr *saddr, *daddr;
 	int *action = &res.action;
 	struct ipv6hdr *ip6h;
-	__be32 flowlabel;
+	struct iphdr *ip4h;
 	int rc;
 
 	memset((void *)fib_params, 0, sizeof(*fib_params));
 
-	ip6h = get_ipv6hdr(ctx, cur);
-	if (unlikely(!ip6h)) {
-		pr_err("invalid access to IPv6 header");
-		goto error;
-	}
+	if (proto == ETH_P_IPV6) {
+		struct in6_addr *saddr, *daddr;
+		__be32 flowlabel;
 
-	if (ip6h->hop_limit <= 1) {
-		/* we let the kernel decide what to do in this situation */
-		pr_debug("hop limit is <= 1, forward it to the kernel stack");
+		ip6h = get_ipv6hdr(ctx, cur);
+		if (unlikely(!ip6h)) {
+			pr_err("invalid access to IPv6 header");
+			goto error;
+		}
+
+		if (ip6h->hop_limit <= 1) {
+			pr_debug("hop limit is <= 1, forward it to the kernel stack");
+			return XDP_PASS;
+		}
+
+		saddr = (struct in6_addr *)fib_params->ipv6_src;
+		daddr = (struct in6_addr *)fib_params->ipv6_dst;
+
+		flowlabel = ip6_flowlabel(ip6h);
+
+		fib_params->family	= AF_INET6;
+		fib_params->flowinfo	= flowlabel;
+		fib_params->l4_protocol	= ip6h->nexthdr;
+		fib_params->tot_len	= bpf_ntohs(ip6h->payload_len);
+		*saddr			= ip6h->saddr;
+		*daddr			= ip6h->daddr;
+	} else if (proto == ETH_P_IP) {
+		ip4h = get_ipv4hdr(ctx, cur);
+		if (unlikely(!ip4h)) {
+			pr_err("invalid access to IPv4 header");
+			goto error;
+		}
+
+		if (ip4h->ttl <= 1) {
+			pr_debug("ttl <= 1, forward it to the kernel stack");
+			return XDP_PASS;
+		}
+
+		fib_params->family	= AF_INET;
+		fib_params->tos		= ip4h->tos;
+		fib_params->l4_protocol	= ip4h->protocol;
+		fib_params->tot_len	= bpf_ntohs(ip4h->tot_len);
+		fib_params->ipv4_src	= ip4h->saddr;
+		fib_params->ipv4_dst	= ip4h->daddr;
+	} else {
+		pr_warn("xdp forward unsupported protocol 0x%x", proto);
 		return XDP_PASS;
 	}
 
-	saddr = (struct in6_addr *)fib_params->ipv6_src;
-	daddr = (struct in6_addr *)fib_params->ipv6_dst;
-
-	flowlabel = ip6_flowlabel(ip6h);
-
-	*saddr			= ip6h->saddr;
-	*daddr			= ip6h->daddr;
-	fib_params->family	= AF_INET6;
-	fib_params->flowinfo	= flowlabel;
-	fib_params->tot_len	= bpf_ntohs(ip6h->payload_len);
-	fib_params->l4_protocol	= ip6h->nexthdr;
 	fib_params->sport	= 0;
 	fib_params->dport	= 0;
 	fib_params->ifindex	= ctx->ingress_ifindex;
@@ -220,15 +250,28 @@ int ipv6_route(struct xdp_md *ctx, struct hdr_cursor *cur, __u32 flags)
 	if (rc != BPF_FIB_LKUP_RET_SUCCESS)
 		goto out;
 
-	/* decrease the hop-limit and prepare the ethernet layer
-	 * for submitting the frame.
-	 */
-	ip6h->hop_limit--;
+	/* decrease hop limit or ttl depending on the current protocol */
+	if (proto == ETH_P_IPV6)
+		ip6h->hop_limit--;
+	else if (proto == ETH_P_IP)
+		ip_decrease_ttl(ip4h);
 out:
 	return *action;
 
 error:
 	return XDP_ABORTED;
+}
+
+static __always_inline
+int ipv6_route(struct xdp_md *ctx, struct hdr_cursor *cur, __u32 flags)
+{
+	return xdp_fwd(ctx, cur, flags, ETH_P_IPV6);
+}
+
+static __always_inline
+int ipv4_route(struct xdp_md *ctx, struct hdr_cursor *cur, __u32 flags)
+{
+	return xdp_fwd(ctx, cur, flags, ETH_P_IP);
 }
 #endif
 
@@ -241,6 +284,19 @@ int ip6_packet_forward(struct xdp_md *ctx, struct hdr_cursor *cur, __u32 flags)
 #else
 	/* pass the packet up to the kernel stack */
 	pr_debug("forward encap packet to the kernel stack");
+	return XDP_PASS;
+#endif
+}
+
+static __always_inline
+int ip4_packet_forward(struct xdp_md *ctx, struct hdr_cursor *cur, __u32 flags)
+{
+#ifdef ROUTING_ACC
+	/* route the packet within XDP context */
+	return ipv4_route(ctx, cur, flags);
+#else
+	/* pass the packet up to the kernel stack */
+	pr_debug("forward decap packet to the kernel stack");
 	return XDP_PASS;
 #endif
 }
@@ -421,9 +477,7 @@ int process_decap_ip4(struct xdp_md *ctx, struct hdr_cursor *cur, __u8 tclass)
 	/* update the IPvv4 TOS field */
 	ipv4_change_dsfield(ip4h, 0xff, tclass);
 
-	pr_debug("decap packet forwarded to the kernel stack");
-
-	return XDP_PASS;
+	return ip4_packet_forward(ctx, cur, 0);
 }
 
 static __always_inline

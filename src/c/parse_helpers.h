@@ -66,6 +66,16 @@ static __always_inline  __u8 ipv4_get_dsfield(const struct iphdr *iph)
 	return iph->tos;
 }
 
+static __always_inline int ip_decrease_ttl(struct iphdr *iph)
+{
+	__u32 check = (__u32)iph->check;
+
+	check += (__u32)bpf_htons(0x0100);
+	iph->check = ( __be16)(check + (check >= 0xffff));
+
+	return --iph->ttl;
+}
+
 #define IPV6_FLOWLABEL_MASK	bpf_htonl(0x0FFFFFFF)
 static inline __be32 ip6_flowlabel(const struct ipv6hdr *hdr)
 {
