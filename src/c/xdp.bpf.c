@@ -3,6 +3,8 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
+#define PRINT_LEVEL 7
+
 #include "common.h"
 #include "parse_helpers.h"
 
@@ -55,7 +57,7 @@ int cur_xdp_shrink_head(struct xdp_md *ctx, struct hdr_cursor *cur, int len)
 
 	rc = cur_xdp_adjust_head(ctx, cur, len);
 	if (unlikely(rc)) {
-		bpf_printk("cannot resize (%d) the xdp frame correctly", len);
+		pr_err("cannot resize (%d) the xdp frame correctly", len);
 		return rc;
 	}
 
@@ -98,7 +100,7 @@ static __always_inline int rebuild_mac_header(struct xdp_md *ctx,
 	return 0;
 
 err:
-	bpf_printk("invalid access to ethernet header");
+	pr_err("invalid access to Ethernet header");
 	return -EINVAL;
 #undef get_ethhdr
 }
@@ -137,6 +139,8 @@ int fib_lookup(struct xdp_md *ctx, struct hdr_cursor *cur,
 		/* lookup successful */
 		eth = cur_header_pointer(ctx, cur->mhoff, sizeof(*eth));
 		if (unlikely(!eth)) {
+			pr_err("invalid access to Ethernet header");
+
 			*action = XDP_ABORTED;
 			return -EINVAL;
 		}
@@ -162,6 +166,8 @@ int fib_lookup(struct xdp_md *ctx, struct hdr_cursor *cur,
 		break;
 	}
 
+	pr_debug("xdp fib_lookup: result=%d, action=%d", rc, *action);
+
 	return rc;
 }
 
@@ -182,12 +188,16 @@ int ipv6_route(struct xdp_md *ctx, struct hdr_cursor *cur, __u32 flags)
 	memset((void *)fib_params, 0, sizeof(*fib_params));
 
 	ip6h = get_ipv6hdr(ctx, cur);
-	if (unlikely(!ip6h))
+	if (unlikely(!ip6h)) {
+		pr_err("invalid access to IPv6 header");
 		goto error;
+	}
 
-	if (ip6h->hop_limit <= 1)
+	if (ip6h->hop_limit <= 1) {
 		/* we let the kernel decide what to do in this situation */
+		pr_debug("hop limit is <= 1, forward it to the kernel stack");
 		return XDP_PASS;
+	}
 
 	saddr = (struct in6_addr *)fib_params->ipv6_src;
 	daddr = (struct in6_addr *)fib_params->ipv6_dst;
@@ -230,6 +240,7 @@ int ip6_packet_forward(struct xdp_md *ctx, struct hdr_cursor *cur, __u32 flags)
 	return ipv6_route(ctx, cur, flags);
 #else
 	/* pass the packet up to the kernel stack */
+	pr_debug("forward encap packet to the kernel stack");
 	return XDP_PASS;
 #endif
 }
@@ -251,7 +262,7 @@ int build_ipv6hdr(struct xdp_md *ctx, struct hdr_cursor *cur,
 
 	ip6h = get_ipv6hdr(ctx, cur);
 	if (unlikely(!ip6h)) {
-		bpf_printk("invalid access to ipv6 header");
+		pr_err("invalid access to IPv6 header");
 		return -EINVAL;
 	}
 
@@ -282,9 +293,11 @@ int do_srh_encap_red_ip4_core(struct xdp_md *ctx, struct hdr_cursor *cur,
 
 	/* lookup for the IPv4 DA in the encap policy table */
 	einfo = encap_policy_lookup_ip4(ip4h);
-	if (!einfo)
-		/* policy not found */
+	if (!einfo) {
+		pr_debug("encap policy for IPv4 DA %x not found",
+			 bpf_ntohl(ip4h->daddr));
 		return XDP_PASS;
+	}
 
 	/* collect all the data for proceeding with encap */
 	payload_info.payload_len = bpf_ntohs(ip4h->tot_len);
@@ -328,9 +341,11 @@ int do_srh_encap_ip4(struct xdp_md *ctx, struct hdr_cursor *cur)
 	int nexthdr;
 
 	nexthdr = parse_ip4hdr(ctx, cur, &ip4h);
-	if (unlikely(nexthdr < 0))
+	if (unlikely(nexthdr < 0)) {
 		/* if we are in trouble... pass the packet to the kernel :-) */
+		pr_warn("cannot parse IPv4 header; forward it to the kernel stack");
 		return XDP_PASS;
+	}
 
 	/* IPv4 has been processed;
 	 * cur->dataoff points to the end of IPv4 header and we update the
@@ -362,14 +377,15 @@ int xdp_sr6encap(struct xdp_md *ctx)
 	cur_reset_mac_header(cur);
 
 	eth_type = parse_ethhdr(ctx, cur, &eth);
-	if (unlikely(eth_type < 0))
+	if (unlikely(eth_type < 0)) {
+		pr_warn("cannot parse Ethernet header; forward it to the kernel stack");
 		goto pass;
+	}
 
 	cur_reset_network_header(cur);
 
 	proto = bpf_ntohs((__be16)eth_type);
 	if (proto != ETH_P_IP)
-		/* ATM we are only processing IPv4 traffic */
 		goto pass;
 
 	/* we do not need to care about VLANs as we have just checked the proto
@@ -394,14 +410,18 @@ int process_decap_ip4(struct xdp_md *ctx, struct hdr_cursor *cur, __u8 tclass)
 	int nexthdr;
 
 	nexthdr = parse_ip4hdr(ctx, cur, &ip4h);
-	if (unlikely(nexthdr < 0))
+	if (unlikely(nexthdr < 0)) {
 		/* if we are in trouble... pass the packet to the kernel :-) */
+		pr_warn("cannot parse IPv4 header; forward it to the kernel stack");
 		return XDP_PASS;
+	}
 
 	cur_reset_transport_header(cur);
 
 	/* update the IPvv4 TOS field */
 	ipv4_change_dsfield(ip4h, 0xff, tclass);
+
+	pr_debug("decap packet forwarded to the kernel stack");
 
 	return XDP_PASS;
 }
@@ -418,10 +438,15 @@ int do_srh_decap_ip4_core(struct xdp_md *ctx, struct hdr_cursor *cur,
 	/* check whether the currend IPv6 DA is bound to a decap SID */
 	rc = sr6_decap_sid_lookup(da);
 	if (rc) {
-		if (likely(rc == -ENOENT))
+		if (likely(rc == -ENOENT)) {
+#define __addr32(DA, IDX) bpf_ntohl((DA)->in6_u.u6_addr32[(IDX)])
 			/* No decap SID found */
+			pr_debug("No decap SID found for IPv6 DA %x %x %x %x",
+				 __addr32(da, 0), __addr32(da, 1),
+				 __addr32(da, 2), __addr32(da, 3));
 			return XDP_PASS;
-
+		}
+#undef __addr32
 		goto abort;
 	}
 
@@ -430,7 +455,8 @@ int do_srh_decap_ip4_core(struct xdp_md *ctx, struct hdr_cursor *cur,
 	/* dataoff and thoff are aligned at this point */
 	shrinklen = cur->dataoff - sizeof(struct ethhdr);
 	if (unlikely(shrinklen < 0)) {
-		bpf_printk("invalid size for xdp frame shrink operation");
+		pr_err("invalid size (%d) for xdp frame shrink operation",
+		        shrinklen);
 		goto abort;
 	}
 
@@ -481,9 +507,11 @@ int do_srh_decap_ip4(struct xdp_md *ctx, struct hdr_cursor *cur)
 	int nexthdr;
 
 	nexthdr = parse_ip6hdr(ctx, cur, &ip6h);
-	if (unlikely(nexthdr < 0))
+	if (unlikely(nexthdr < 0)) {
 		/* if we are in trouble... pass the packet to the kernel :-) */
+		pr_warn("cannot parse IPv6 header; forward it to the kernel stack");
 		goto pass;
+	}
 
 	/* let's check the nexthdr type; ATM we only support IPv4 directly
 	 * encapsulated.
@@ -515,8 +543,10 @@ int xdp_sr6decap(struct xdp_md *ctx)
 	cur_reset_mac_header(cur);
 
 	eth_type = parse_ethhdr(ctx, cur, &eth);
-	if (unlikely(eth_type < 0))
+	if (unlikely(eth_type < 0)) {
+		pr_warn("cannot parse Ethernet header; forward it to the kernel stack");
 		goto pass;
+	}
 
 	cur_reset_network_header(cur);
 
