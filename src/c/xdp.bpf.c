@@ -68,14 +68,6 @@ int cur_xdp_expand_head(struct xdp_md *ctx, struct hdr_cursor *cur, int len)
 	return cur_xdp_shrink_head(ctx, cur, -len);
 }
 
-
-static __always_inline int vlan_check(struct hdr_cursor *cur)
-{
-	int maclen = cur->nhoff - cur->mhoff;
-
-	return (maclen == sizeof(struct ethhdr)) ? 0 : -EOPNOTSUPP;
-}
-
 static __always_inline int rebuild_mac_header(struct xdp_md *ctx,
 					      struct hdr_cursor *cur, int len,
 					      __u16 proto)
@@ -380,6 +372,10 @@ int xdp_sr6encap(struct xdp_md *ctx)
 		/* ATM we are only processing IPv4 traffic */
 		goto pass;
 
+	/* we do not need to care about VLANs as we have just checked the proto
+	 * type AND is NOT vlan!
+	 */
+
 	return do_srh_encap_ip4(ctx, cur);
 
 pass:
@@ -524,13 +520,13 @@ int xdp_sr6decap(struct xdp_md *ctx)
 
 	cur_reset_network_header(cur);
 
-	if (vlan_check(cur))
-		/* VLAn is not supported yet */
-		goto pass;
-
 	proto = bpf_ntohs((__be16)eth_type);
 	if (proto != ETH_P_IPV6)
 		goto pass;
+
+	/* we do not need to care about VLANs as we have just checked the proto
+	 * type AND is NOT vlan!
+	 */
 
 	return do_srh_decap_ip4(ctx, cur);
 
