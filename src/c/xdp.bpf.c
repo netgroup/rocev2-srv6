@@ -3,7 +3,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
-#define PRINT_LEVEL 7
+#define PRINT_LEVEL 4
 
 #include "common.h"
 #include "parse_helpers.h"
