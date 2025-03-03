@@ -174,7 +174,8 @@ int fib_lookup(struct xdp_md *ctx, struct hdr_cursor *cur,
 		break;
 	}
 
-	pr_debug("xdp fib_lookup: result=%d, action=%d", rc, *action);
+	pr_debug("xdp fib_lookup: (proto 0x%x, lookup ifindex=%d) result=%d, action=%d",
+		 res->proto, fib_params->ifindex, rc, *action);
 
 	return rc;
 }
