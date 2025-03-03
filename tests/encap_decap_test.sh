@@ -150,12 +150,13 @@ read -r -d '' r0_env <<-EOF
 	# key:
 	# 	0-15:	SID 				(fc01:0:0512::)
 	# value:
-	# 	0-7:	reserved
+	# 	0-3: table id (254)
+	# 	4-7: reserved
 	${BPFTOOL} \
 		map update \
 		pinned "${BPFFS_PATH}/maps/sr6decap_table"			\
 	        key hex         fc 01 00 00 05 12 00 00 00 00 00 00 00 00 00 00 \
-	        value hex       00 00 00 00 00 00 00 00
+	        value hex       fe 00 00 00 00 00 00 00
 
 	${BPFTOOL} net attach xdpdrv \
 		pinned "${BPFFS_PATH}/progs/xdp_sr6encap" \
@@ -235,12 +236,13 @@ read -r -d '' r1_env <<-EOF
 	# key:
 	# 	0-15:	SID 				(fc00:0:0512::)
 	# value:
-	# 	0-7:	reserved
+	# 	0-3: table id (254)
+	# 	4-7: reserved
 	${BPFTOOL} \
 		map update \
 		pinned "${BPFFS_PATH}/maps/sr6decap_table"			\
 	        key hex         fc 00 00 00 05 12 00 00 00 00 00 00 00 00 00 00 \
-	        value hex       00 00 00 00 00 00 00 00
+	        value hex       fe 00 00 00 00 00 00 00
 
 	${BPFTOOL} net attach xdpdrv \
 		pinned "${BPFFS_PATH}/progs/xdp_sr6encap" \

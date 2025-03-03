@@ -12,7 +12,7 @@
  * context and packet is directly redirect to the egress device; Otherwise, the
  * packet is passed up to thek kernel stack for further processing.
 */
-#if 0
+#if 1
 #define ROUTING_ACC
 #endif
 
@@ -23,7 +23,8 @@ struct sr6_encap_red_info {
 #define SR6_ENCAP_RED_HEADROOM sizeof(struct ipv6hdr)
 
 struct sr6_decap_info {
-	__u64 reserved;
+	__u32 tbid;
+	__u32 reserved;
 };
 
 #define SRH_ENCAPV4_MAX_ENTRIES 256
@@ -120,12 +121,15 @@ struct ip6_payload_info {
 	((struct ipv6hdr *)cur_header_pointer(ctx, (cur)->nhoff,	\
 					      sizeof(struct ipv6hdr)))
 
-#ifdef ROUTING_ACC
 struct fib_res_lookup {
 	struct bpf_fib_lookup fib_params;
 	__u32 flags;
+	__u32 tbid;
+	__u32 proto;
 	int action;
 };
+
+#ifdef ROUTING_ACC
 
 static __always_inline
 int fib_lookup(struct xdp_md *ctx, struct hdr_cursor *cur,
@@ -176,15 +180,13 @@ int fib_lookup(struct xdp_md *ctx, struct hdr_cursor *cur,
 }
 
 static __always_inline
-int xdp_fwd(struct xdp_md *ctx, struct hdr_cursor *cur, __u32 flags,
-	    __u16 proto)
+int xdp_fwd(struct xdp_md *ctx, struct hdr_cursor *cur,
+	    struct fib_res_lookup *res)
 {
-	struct fib_res_lookup res = {
-		.flags = 0,
-		.action = XDP_ABORTED,
-	};
-	struct bpf_fib_lookup *fib_params = &res.fib_params;
-	int *action = &res.action;
+	struct bpf_fib_lookup *fib_params = &res->fib_params;
+	int *action = &res->action;
+	__u32 proto = res->proto;
+	__u32 tbid = res->tbid;
 	struct ipv6hdr *ip6h;
 	struct iphdr *ip4h;
 	int rc;
@@ -240,11 +242,14 @@ int xdp_fwd(struct xdp_md *ctx, struct hdr_cursor *cur, __u32 flags,
 		return XDP_PASS;
 	}
 
+	if (tbid)
+		fib_params->tbid = tbid;
+
 	fib_params->sport	= 0;
 	fib_params->dport	= 0;
 	fib_params->ifindex	= ctx->ingress_ifindex;
 
-	rc = fib_lookup(ctx, cur, &res);
+	rc = fib_lookup(ctx, cur, res);
 	if (unlikely(rc < 0))
 		goto error;
 	if (rc != BPF_FIB_LKUP_RET_SUCCESS)
@@ -263,24 +268,27 @@ error:
 }
 
 static __always_inline
-int ipv6_route(struct xdp_md *ctx, struct hdr_cursor *cur, __u32 flags)
+int ipv6_route(struct xdp_md *ctx, struct hdr_cursor *cur,
+	       struct fib_res_lookup *res)
 {
-	return xdp_fwd(ctx, cur, flags, ETH_P_IPV6);
+	return xdp_fwd(ctx, cur, res);
 }
 
 static __always_inline
-int ipv4_route(struct xdp_md *ctx, struct hdr_cursor *cur, __u32 flags)
+int ipv4_route(struct xdp_md *ctx, struct hdr_cursor *cur,
+	       struct fib_res_lookup *res)
 {
-	return xdp_fwd(ctx, cur, flags, ETH_P_IP);
+	return xdp_fwd(ctx, cur, res);
 }
 #endif
 
 static __always_inline
-int ip6_packet_forward(struct xdp_md *ctx, struct hdr_cursor *cur, __u32 flags)
+int ip6_packet_forward(struct xdp_md *ctx, struct hdr_cursor *cur,
+		       struct fib_res_lookup *res)
 {
 #ifdef ROUTING_ACC
 	/* route the packet within XDP context */
-	return ipv6_route(ctx, cur, flags);
+	return ipv6_route(ctx, cur, res);
 #else
 	/* pass the packet up to the kernel stack */
 	pr_debug("forward encap packet to the kernel stack");
@@ -289,11 +297,12 @@ int ip6_packet_forward(struct xdp_md *ctx, struct hdr_cursor *cur, __u32 flags)
 }
 
 static __always_inline
-int ip4_packet_forward(struct xdp_md *ctx, struct hdr_cursor *cur, __u32 flags)
+int ip4_packet_forward(struct xdp_md *ctx, struct hdr_cursor *cur,
+		       struct fib_res_lookup *res)
 {
 #ifdef ROUTING_ACC
 	/* route the packet within XDP context */
-	return ipv4_route(ctx, cur, flags);
+	return ipv4_route(ctx, cur, res);
 #else
 	/* pass the packet up to the kernel stack */
 	pr_debug("forward decap packet to the kernel stack");
@@ -345,6 +354,11 @@ int do_srh_encap_red_ip4_core(struct xdp_md *ctx, struct hdr_cursor *cur,
 	const __u16 encap_len = SR6_ENCAP_RED_HEADROOM;
 	struct ip6_payload_info payload_info = { 0, };
 	struct sr6_encap_red_info *einfo;
+	struct fib_res_lookup res = {
+		.flags = 0,
+		.action = XDP_ABORTED,
+		.proto = ETH_P_IPV6,
+	};
 	int rc;
 
 	/* lookup for the IPv4 DA in the encap policy table */
@@ -383,7 +397,7 @@ int do_srh_encap_red_ip4_core(struct xdp_md *ctx, struct hdr_cursor *cur,
 		goto abort;
 
 	/* forward the packet doing routing lookup */
-	return ip6_packet_forward(ctx, cur, 0);
+	return ip6_packet_forward(ctx, cur, &res);
 
 abort:
 	return XDP_ABORTED;
@@ -454,14 +468,22 @@ pass:
 	return XDP_PASS;
 }
 
-static __always_inline int sr6_decap_sid_lookup(const struct in6_addr *sid)
+static __always_inline
+struct sr6_decap_info *sr6_decap_sid_lookup(const struct in6_addr *sid)
 {
-	return bpf_map_lookup_elem(&sr6decap_table, sid) ? 0 : -ENOENT;
+	return bpf_map_lookup_elem(&sr6decap_table, sid);
 }
 
 static __always_inline
-int process_decap_ip4(struct xdp_md *ctx, struct hdr_cursor *cur, __u8 tclass)
+int process_decap_ip4(struct xdp_md *ctx, struct hdr_cursor *cur, __u8 tclass,
+		      __u32 tbid)
 {
+	struct fib_res_lookup res = {
+		.flags = BPF_FIB_LOOKUP_DIRECT | BPF_FIB_LOOKUP_TBID,
+		.action = XDP_ABORTED,
+		.tbid = tbid,
+		.proto = ETH_P_IP,
+	};
 	struct iphdr *ip4h;
 	int nexthdr;
 
@@ -477,7 +499,7 @@ int process_decap_ip4(struct xdp_md *ctx, struct hdr_cursor *cur, __u8 tclass)
 	/* update the IPvv4 TOS field */
 	ipv4_change_dsfield(ip4h, 0xff, tclass);
 
-	return ip4_packet_forward(ctx, cur, 0);
+	return ip4_packet_forward(ctx, cur, &res);
 }
 
 static __always_inline
@@ -485,26 +507,27 @@ int do_srh_decap_ip4_core(struct xdp_md *ctx, struct hdr_cursor *cur,
 			  struct ipv6hdr *ip6h)
 {
 	const struct in6_addr *da = &ip6h->daddr;
+	struct sr6_decap_info *dinfo;
 	int shrinklen;
 	__u8 tclass;
+	__u32 tbid;
 	int rc;
 
 	/* check whether the currend IPv6 DA is bound to a decap SID */
-	rc = sr6_decap_sid_lookup(da);
-	if (rc) {
-		if (likely(rc == -ENOENT)) {
+	dinfo = sr6_decap_sid_lookup(da);
+	if (!dinfo) {
 #define __addr32(DA, IDX) bpf_ntohl((DA)->in6_u.u6_addr32[(IDX)])
-			/* No decap SID found */
-			pr_debug("No decap SID found for IPv6 DA %x %x %x %x",
-				 __addr32(da, 0), __addr32(da, 1),
-				 __addr32(da, 2), __addr32(da, 3));
-			return XDP_PASS;
-		}
+		/* No decap SID found */
+		pr_debug("No decap SID found for IPv6 DA %x %x %x %x",
+			 __addr32(da, 0), __addr32(da, 1),
+			 __addr32(da, 2), __addr32(da, 3));
+		return XDP_PASS;
 #undef __addr32
-		goto abort;
 	}
 
 	tclass = ipv6_get_dsfield(ip6h);
+	/* retrieve the table id used for fib lookup on decap packet */
+	tbid = dinfo->tbid;
 
 	/* dataoff and thoff are aligned at this point */
 	shrinklen = cur->dataoff - sizeof(struct ethhdr);
@@ -548,7 +571,7 @@ int do_srh_decap_ip4_core(struct xdp_md *ctx, struct hdr_cursor *cur,
 	if (unlikely(rc))
 		goto abort;
 
-	return process_decap_ip4(ctx, cur, tclass);
+	return process_decap_ip4(ctx, cur, tclass, tbid);
 
 abort:
 	return XDP_ABORTED;
