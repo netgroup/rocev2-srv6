@@ -1,12 +1,12 @@
 #!/bin/bash
 
-#                set CE on outer IPv6 traffic class
-#  enable ECT bit                +
-#      +                         |
-#      |              +----------|---+     +--------------+     +--------------+
-#      v              |      gw1 |   |     |      rt0     |     |      gw2     |
-#  +-------+          |          |   |     |              |     |              |        +-------+
-#  |   h0  |          |          v   |     |              |     |              |        |  h1   |
+#                        set CE on outer IPv6 traffic class (prerouting)
+#  enable ECT bit                             |
+#      +                                      |
+#      |              +--------------+     +--|-----------+     +--------------+
+#      v              |      gw1     |     |  |   rt0     |     |      gw2     |
+#  +-------+          | vrf          |     |  |           |     |         vrf  |        +-------+
+#  |   h0  |          |  |           |     |  v           |     |          |   |        |  h1   |
 #  |       +----------+veth1    veth2+-----+veth3    veth4+-----+veth5    veth6+--------+       |
 #  | veth0 |          |  ^       ^   |     |  ^       ^   |     |  ^       ^   |        | veth7 |
 #  +-------+          |  |  (a1) |   |     |  |  (b0) |   |     |  |  (a2) |   |        +-------+
@@ -25,6 +25,9 @@ set -x
 readonly BPFTOOL="../bpftool/src/bpftool"
 readonly OBJ_PATH="../src/c/.output/"
 readonly BPFFS_PATH="/sys/fs/bpf"
+
+readonly DC_MTU=2048
+readonly ECN_MARK=yes
 
 readonly TMUX=ebpf
 readonly DEBUG=off
@@ -52,6 +55,22 @@ ip link add veth2 netns gw1 type veth peer name veth3 netns rt0
 ip link add veth4 netns rt0 type veth peer name veth5 netns gw2
 ip link add veth6 netns gw2 type veth peer name veth7 netns h1
 
+# XXX: WORKAROUND on veth pairs we MUST to disable {tx,rx}-checksum with
+# ethtool to make it work!!!
+disable_checksum_offload()
+{
+	local ifname="${2}"
+	local nsname="${1}"
+
+	for i in $(ip netns exec "${nsname}" \
+		   ethtool -k "${ifname}" | \
+		   grep -E "(tx|rx)-checksum" | \
+		   awk '{print $1}' | \
+		   cut -d':' -f1); do
+		ip netns exec "${nsname}" ethtool -K "${ifname}" "${i}" off || \
+		true;
+	done
+}
 
 ###################
 #### Node: h0 #####
@@ -63,10 +82,19 @@ ip netns exec $NODE ip link set dev veth0 up
 ip netns exec $NODE ip addr add 10.0.1.1/24 dev veth0
 ip netns exec $NODE ip -4 route add default via 10.0.1.254 dev veth0
 
-# set ECT(0)
-ip netns exec $NODE \
-	iptables -t mangle -A POSTROUTING \
-	-d 10.0.2.1 -j TOS --set-tos 0x02/0xff
+if [ "${ECN_MARK}" == "yes" ]; then
+	# set ECT(0)
+	ip netns exec $NODE iptables \
+		-t mangle -A POSTROUTING \
+		-d 10.0.2.1 -j TOS --set-tos 0x02/0xff
+fi
+
+# clamp the MSS on node h0
+#ip netns exec $NODE iptables \
+#	-t mangle -A OUTPUT \
+#	-d 10.0.2.1 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1360
+
+disable_checksum_offload $NODE veth0
 
 set +e
 read -r -d '' h0_env <<-EOF
@@ -109,7 +137,7 @@ ip netns exec $NODE sysctl -w net.ipv4.conf.veth2.rp_filter=0
 
 ip netns exec $NODE ip link set dev lo up
 ip netns exec $NODE ip link set dev veth2 up
-ip netns exec $NODE ip link set dev veth2 mtu 9000
+ip netns exec $NODE ip link set dev veth2 mtu "${DC_MTU}"
 ip netns exec $NODE ip addr add fd00:a1:b0::1/48 dev veth2
 
 # Add VRF interface
@@ -141,6 +169,22 @@ if [ "$DEBUG" == "on" ]; then
 	ip -netns $NODE -6 route \
 		add unreachable default metric 4278198272 \
 		vrf vrf-100
+else
+	# XXX: WORKAROUND The eBPF/XDP fib_lookup function does not populate
+	# the neighbor cache. When the packet is decapsulated and sent back to
+	# the kernel stack, the FIB entry for 10.0.1.0/24 in table 100 (the VRF
+	# table) is not considered. This occurs because the received packet is
+	# not originating from a VRF's slave, and there are no existing rules
+	# directing (decap) IPv4 traffic to reference the VRF table.
+	# Consequently, we need to establish a route (in the main table)
+	# indicating that traffic destined for 10.0.1.0/24 should be forwarded
+	# using the FIBs associated with the VRF.
+	#
+	# This operation is only needed the very first time a decap IPv4 is
+	# seen, as the neigh cache is filled and subsequent packets will be
+	# forwarded using the eBPF/XDP forward facility.
+
+	ip -netns $NODE -4 route add 10.0.1.0/24 dev vrf-100
 fi
 
 # all sids start with a common locator
@@ -149,9 +193,8 @@ ip -netns $NODE -6 rule add to fc00:0::/12 lookup 90 prio 999
 # Forward Routing
 ip netns exec $NODE ip -6 route add fc00:0::/32 via fd00:a1:b0::2 dev veth2 table 90
 
-# ip6tables rule to mark ECT+CE traffic
-ip netns exec $NODE ip6tables \
-	-t mangle -A POSTROUTING -d fc00:0:512:: -j TOS --set-tos 0x03/0xff
+disable_checksum_offload $NODE veth1
+disable_checksum_offload $NODE veth2
 
 set +e
 read -r -d '' gw1_env <<-EOF
@@ -177,12 +220,14 @@ read -r -d '' gw1_env <<-EOF
 	# key:
 	# 	0-15:	SID 				(fc01:0:0512::)
 	# value:
-	# 	0-7:	reserved
+	# 	0-3: table id (100)
+	# 	4-7: reserved
 	${BPFTOOL} \
 		map update \
 		pinned "${BPFFS_PATH}/maps/sr6decap_table"			\
 	        key hex         fc 01 00 00 05 12 00 00 00 00 00 00 00 00 00 00 \
-	        value hex       00 00 00 00 00 00 00 00
+	        value hex       64 00 00 00 \
+				00 00 00 00
 
 	${BPFTOOL} net attach xdpdrv \
 		pinned "${BPFFS_PATH}/progs/xdp_sr6encap" \
@@ -216,8 +261,8 @@ ip netns exec $NODE sysctl -w net.ipv6.conf.all.forwarding=1
 ip netns exec $NODE ip link set dev lo up
 ip netns exec $NODE ip link set dev veth3 up
 ip netns exec $NODE ip link set dev veth4 up
-ip netns exec $NODE ip link set dev veth3 mtu 9000
-ip netns exec $NODE ip link set dev veth4 mtu 9000
+ip netns exec $NODE ip link set dev veth3 mtu "${DC_MTU}"
+ip netns exec $NODE ip link set dev veth4 mtu "${DC_MTU}"
 ip netns exec $NODE ip addr add fd00:a1:b0::2/48 dev veth3
 ip netns exec $NODE ip addr add fd00:b0:a2::1/48 dev veth4
 
@@ -231,6 +276,17 @@ ip netns exec $NODE ip -6 route add fc00:0::/32 via fd00:b0:a2::2 dev veth4
 
 # Reverse Routing
 ip netns exec $NODE ip -6 route add fc01:0::/32 via fd00:a1:b0::1 dev veth3
+
+if [ "${ECN_MARK}" == "yes" ]; then
+	# ip6tables rule to mark ECT+CE traffic
+	ip netns exec $NODE ip6tables \
+		-t mangle -A PREROUTING \
+		-d fc00:0:512:: \
+		-j TOS --set-tos 0x01/0x01
+fi
+
+disable_checksum_offload $NODE veth3
+disable_checksum_offload $NODE veth4
 
 set +e
 read -r -d '' rt0_env <<-EOF
@@ -277,7 +333,7 @@ ip netns exec $NODE sysctl -w net.ipv4.conf.veth6.rp_filter=0
 
 ip netns exec $NODE ip link set dev lo up
 ip netns exec $NODE ip link set dev veth5 up
-ip netns exec $NODE ip link set dev veth5 mtu 9000
+ip netns exec $NODE ip link set dev veth5 mtu "${DC_MTU}"
 ip netns exec $NODE ip addr add fd00:b0:a2::2/48 dev veth5
 
 # Add VRF interface
@@ -310,6 +366,9 @@ if [ "$DEBUG" == "on" ]; then
 	ip -netns $NODE -6 route \
 		add unreachable default metric 4278198272 \
 		vrf vrf-100
+else
+	# @see description given in gw1
+	ip -netns $NODE -4 route add 10.0.2.0/24 dev vrf-100
 fi
 
 # all sids start with a common locator
@@ -317,6 +376,9 @@ ip -netns $NODE -6 rule add to fc01:0::/12 lookup 90 prio 999
 
 # Reverse Routing
 ip netns exec $NODE ip -6 route add fc01:0::/32 via fd00:b0:a2::1 dev veth5 table 90
+
+disable_checksum_offload $NODE veth5
+disable_checksum_offload $NODE veth6
 
 set +e
 read -r -d '' gw2_env <<-EOF
@@ -341,12 +403,14 @@ read -r -d '' gw2_env <<-EOF
 	# key:
 	# 	0-15:	SID 				(fc00:0:0512::)
 	# value:
-	# 	0-7:	reserved
+	# 	0-3: table id (100)
+	# 	4-7: reserved
 	${BPFTOOL} \
 		map update \
 		pinned "${BPFFS_PATH}/maps/sr6decap_table"			\
 	        key hex         fc 00 00 00 05 12 00 00 00 00 00 00 00 00 00 00 \
-	        value hex       00 00 00 00 00 00 00 00
+	        value hex       64 00 00 00 \
+				00 00 00 00
 
 	${BPFTOOL} net attach xdpdrv \
 		pinned "${BPFFS_PATH}/progs/xdp_sr6encap" \
@@ -379,6 +443,8 @@ ip netns exec $NODE ip link set dev lo up
 ip netns exec $NODE ip link set dev veth7 up
 ip netns exec $NODE ip addr add 10.0.2.1/24 dev veth7
 ip netns exec $NODE ip -4 route add 10.0.1.0/24 via 10.0.2.254 dev veth7
+
+disable_checksum_offload $NODE veth7
 
 set +e
 read -r -d '' h1_env <<-EOF
