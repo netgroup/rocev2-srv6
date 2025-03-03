@@ -130,7 +130,6 @@ struct fib_res_lookup {
 };
 
 #ifdef ROUTING_ACC
-
 static __always_inline
 int fib_lookup(struct xdp_md *ctx, struct hdr_cursor *cur,
 	       struct fib_res_lookup *res)
@@ -281,7 +280,7 @@ int ipv4_route(struct xdp_md *ctx, struct hdr_cursor *cur,
 {
 	return xdp_fwd(ctx, cur, res);
 }
-#endif
+#endif /* ROUTING_ACC */
 
 static __always_inline
 int ip6_packet_forward(struct xdp_md *ctx, struct hdr_cursor *cur,
