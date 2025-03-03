@@ -10,7 +10,7 @@
 
 /* define routing acceleration; if set the routing is carried out in XDP/eBPF
  * context and packet is directly redirect to the egress device; Otherwise, the
- * packet is passed up to thek kernel stack for further processing.
+ * packet is passed up to the kernel stack for further processing.
 */
 #if 1
 #define ROUTING_ACC
