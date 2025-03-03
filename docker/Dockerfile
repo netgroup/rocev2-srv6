@@ -17,6 +17,7 @@ RUN apt-get install -y \
         libelf-dev \
 	universal-ctags \
 	termshark \
+	iperf3 \
         gcc-multilib \
         gpg \
         vim \
