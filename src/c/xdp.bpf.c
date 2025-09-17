@@ -107,12 +107,12 @@ struct qp_stats {
 };
 
 #define QP_STATS_MAX        4096
-#define BASE_THRESHOLD_BPS  (1000000000ULL)   // 1 Gbps
-#define BELOW_TARGET_NS     (100000000ULL)   // 10 ms
+#define BASE_THRESHOLD_BPS  (10000000000ULL)   // 10 Gbps
+#define BELOW_TARGET_NS     (1000000ULL)   // 1 ms
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, QP_STATS_MAX); 
+    __uint(max_entries, QP_STATS_MAX);
     __type(key, __be32);            
     __type(value, struct qp_stats);
 } qp_throughput SEC(".maps");
@@ -166,6 +166,8 @@ __be32 parse_ascii_to_be32(const char *ascii)
 static __always_inline
 int get_remote_qp(struct xdp_md *ctx, struct hdr_cursor *cur)
 {
+    void *data_end = (void *)(long)ctx->data_end;
+
     /* tcph all’inizio del trasporto: usa cur->thoff e non toccare cur->pos */
     struct tcphdr *tcph = (struct tcphdr *)cur_header_pointer(ctx, cur->thoff, sizeof(*tcph));
     if (!tcph)
@@ -196,7 +198,9 @@ int get_remote_qp(struct xdp_md *ctx, struct hdr_cursor *cur)
 
 int get_local_qp(struct xdp_md *ctx, struct hdr_cursor *cur)
 {
-   /* tcph all’inizio del trasporto: usa cur->thoff e non toccare cur->pos */
+    void *data_end = (void *)(long)ctx->data_end;
+
+    /* tcph all’inizio del trasporto: usa cur->thoff e non toccare cur->pos */
     struct tcphdr *tcph = (struct tcphdr *)cur_header_pointer(ctx, cur->thoff, sizeof(*tcph));
     if (!tcph)
         return -1;
@@ -232,7 +236,8 @@ static __always_inline void flip_route_for_ip_qp(__be32 dst_ip_n, __u32 dqpn)
     struct encap_qp_key k = { .dst_ip = bpf_ntohl(dst_ip_n), .qpn =dqpn};
    // bpf_printk("address in the key 0x%x", k.dst_ip);
    // bpf_printk("qpn in the key 0x%x", k.qpn);
-   struct sr6_encap_red_info *cur = bpf_map_lookup_elem(&sr6encap_ip4_qp_table, &k);
+    struct sr6_encap_red_info base = {0};
+    struct sr6_encap_red_info *cur = bpf_map_lookup_elem(&sr6encap_ip4_qp_table, &k);
 
     if (cur) {
         // toggla PRIMARY <-> SECONDARY, mantieni tunsrc
@@ -292,6 +297,22 @@ static __always_inline void qp_update_throughput_and_maybe_reroute(struct xdp_md
  //   bpf_printk("qpn in the key 0x%x", k.qpn);
     
     struct sr6_encap_red_info *curv = bpf_map_lookup_elem(&sr6encap_ip4_qp_table, &k);
+    if(curv){
+        const __u8 *ts = curv->tunsrc.in6_u.u6_addr8;
+        const __u8 *sd = curv->sid.in6_u.u6_addr8;
+        
+       /* bpf_printk("tunsrc = %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                   ts[0], ts[1], ts[2], ts[3], ts[4], ts[5], ts[6], ts[7]);
+        bpf_printk("         %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                   ts[8], ts[9], ts[10], ts[11], ts[12], ts[13], ts[14], ts[15]);
+
+        bpf_printk("sid    = %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                   sd[0], sd[1], sd[2], sd[3], sd[4], sd[5], sd[6], sd[7]);
+        bpf_printk("         %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                   sd[8], sd[9], sd[10], sd[11], sd[12], sd[13], sd[14], sd[15]);*/
+    }    
+               
+               
     if (!curv) {
      //   bpf_printk("Entry not found");
         struct sr6_encap_red_info init = {0,};
@@ -381,8 +402,9 @@ struct sr6_encap_red_info *encap_policy_lookup_ip4_qp(struct xdp_md *ctx,
            }
       } else {
            // __push(cur, sizeof(*udph));
-           /* non sembra un BTH valido → fallback per-dest */
+           /*fallback per-dest */
             return encap_policy_lookup_ip4(ip4h);
+
         }
   }
 
@@ -704,15 +726,21 @@ int do_srh_encap_red_ip4_core(struct xdp_md *ctx, struct hdr_cursor *cur,
 	einfo = encap_policy_lookup_ip4_qp(ctx, cur, ip4h); //substitution with per-qp lookup function
 
 	if (!einfo) {
-		pr_debug("encap policy for IPv4 DA %x not found",
-			 bpf_ntohl(ip4h->daddr));
-		return XDP_PASS;
+		
+		einfo = encap_policy_lookup_ip4(ip4h);
+		if (!einfo) {
+			bpf_printk("encap policy for IPv4 DA %x not found",
+				bpf_ntohl(ip4h->daddr));
+			return XDP_PASS;
+		}
 	}
+
 
 	/* collect all the data for proceeding with encap */
 	payload_info.payload_len = bpf_ntohs(ip4h->tot_len);
 	payload_info.nexthdr = IPPROTO_IPIP;
 	payload_info.tos = ip4h->tos;
+	bpf_printk("tos field: %u", ip4h->tos);
 
 	payload_info.encap_info = einfo;
 
@@ -857,7 +885,7 @@ int process_decap_ip4(struct xdp_md *ctx, struct hdr_cursor *cur, __u8 tclass,
                     qp_update_throughput_and_maybe_reroute(ctx, cur, ip4h, udp_len);
 
                 } else {
-             //       bpf_printk("RoCEv2: UDP too short (%u)\n", udp_len);
+                    bpf_printk("RoCEv2: UDP too short (%u)\n", udp_len);
                 }
     }
 	}

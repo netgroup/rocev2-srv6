@@ -43,6 +43,8 @@
 /* @see
  * https://elixir.bootlin.com/linux/v6.13.4/source/include/net/dsfield.h#L22
  */
+
+
 static __always_inline
 void ipv4_change_dsfield(struct iphdr *iph,__u8 mask, __u8 value)
 {
@@ -372,4 +374,13 @@ ipv6_find_hdr(struct xdp_md *ctx, struct hdr_cursor *cur, int *offset,
 #undef __PTRHDR
 }
 
+static __always_inline
+void ipv6_change_dsfield(struct ipv6hdr *ip6h, __u8 mask, __u8 value)
+{
+    __u8 tclass = ipv6_get_dsfield(ip6h);   // legge Traffic Class (8 bit: DSCP+ECN)
+    tclass = (tclass & mask) | value;       // aggiorna solo i bit richiesti
+    ip6_flow_hdr(ip6h, tclass, ip6_flowlabel(ip6h));  // riscrive tclass mantenendo flowlabel
+}
+
 #endif /* end of #ifdef for include header file */
+
