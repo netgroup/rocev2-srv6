@@ -23,8 +23,8 @@ CFLAGS := -g -Wall
 ALL_LDFLAGS := $(LDFLAGS) $(EXTRA_LDFLAGS)
 
 #APPS = xdp
-KERNEL_APPS = xdp
-
+KERNEL_APPS = xdp # xdp
+#KERNEL_APPS= cnp_xdp
 # Get Clang's default includes on this system. We'll explicitly add these dirs
 # to the includes list when compiling with `-target bpf` because otherwise some
 # architecture-specific dirs will be "missing" on some architectures/distros -

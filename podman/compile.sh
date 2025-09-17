@@ -1,6 +1,7 @@
 #!/bin/bash
 
-sudo podman run \
+sudo rm -r ../src/c/.output
+podman run \
 	--rm \
 	--replace \
 	--name rocesrv6-builder \
