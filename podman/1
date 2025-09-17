@@ -1,0 +1,57 @@
+#!/bin/bash
+
+set -eu
+set -x
+
+readonly BPFTOOL="../bpftool/src/bpftool"
+readonly OBJ_PATH="../src/c/.output/"
+readonly BPFFS_PATH="/sys/fs/bpf"
+
+readonly DC_MTU=9000  # Match VDC_MTU from virtual_network.sh
+readonly ECN_MARK=yes
+
+readonly TMUX=ebpf
+readonly DEBUG=off
+
+if ! command -v "${BPFTOOL}" &>/dev/null; then
+    echo "bpftool program is not available"
+    exit 1
+fi
+
+# Kill existing tmux session
+tmux kill-session -t $TMUX 2>/dev/null || true
+
+# Use existing namespaces from virtual_network.sh
+ip netns list | grep -E "gw1|rt1|rt2|gw2" || { echo "Namespaces missing! Run virtual_network.sh first."; exit 1; }
+
+# Interface mapping based on dynamic veth pair naming
+VETH_GW1_RT1="veth-gw1-rt1"
+VETH_RT1_GW1="veth-rt1-gw1"
+VETH_GW2_RT2="veth-gw2-rt2"
+VETH_RT2_GW2="veth-rt2-gw2"
+
+# XDP setup for gw1
+echo "Configuring eBPF/XDP for gw1"
+ip netns exec gw1 ${BPFTOOL} prog loadall "${OBJ_PATH}/xdp.bpf.o" /sys/fs/bpf/progs pinmaps /sys/fs/bpf/maps type xdp
+ip netns exec gw1 ${BPFTOOL} net attach xdpdrv pinned /sys/fs/bpf/progs/xdp_sr6decap dev $VETH_GW1_RT1
+ip netns exec gw1 ${BPFTOOL} net attach xdpdrv pinned /sys/fs/bpf/progs/xdp_sr6encap dev $VETH_RT1_GW1
+
+# XDP setup for gw2
+echo "Configuring eBPF/XDP for gw2"
+ip netns exec gw2 ${BPFTOOL} prog loadall "${OBJ_PATH}/xdp.bpf.o" /sys/fs/bpf/progs pinmaps /sys/fs/bpf/maps type xdp
+ip netns exec gw2 ${BPFTOOL} net attach xdpdrv pinned /sys/fs/bpf/progs/xdp_sr6decap dev $VETH_GW2_RT2
+ip netns exec gw2 ${BPFTOOL} net attach xdpdrv pinned /sys/fs/bpf/progs/xdp_sr6encap dev $VETH_RT2_GW2
+
+# Routing Adjustments
+echo "Adjusting SRv6 routing"
+ip netns exec gw1 ip -6 route add fc00:0::/32 via fd00:b1:0e::2 dev $VETH_GW1_RT1 table 90
+ip netns exec gw2 ip -6 route add fc01:0::/32 via fd00:a2:d4::1 dev $VETH_GW2_RT2 table 90
+
+# Start tmux session
+tmux new-session -d -s $TMUX -n gw1 ip netns exec gw1 bash
+
+tmux new-window -t $TMUX -n gw2 ip netns exec gw2 bash
+
+tmux set-option -g mouse on
+tmux attach -t $TMUX
+

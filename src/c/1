@@ -1,0 +1,110 @@
+#include <linux/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/ipv6.h>
+#include <linux/udp.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
+#include <linux/in.h>
+
+#define TIME_INTERVAL_NS (100 * 1000000) // 100ms in nanoseconds
+
+// Define a structure for tracking CNP packets
+struct cnp_data {
+    __u64 count;
+    __u64 last_time;
+};
+
+// BPF map to store CNP tracking data
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct cnp_data);
+} cnp_counter SEC(".maps");
+
+SEC("xdp")
+int xdp_detect_cnp(struct xdp_md *xdp) {
+    void *data_end = (void *)(long)xdp->data_end;
+    void *data = (void *)(long)xdp->data;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return XDP_PASS;
+
+    __u16 eth_type = bpf_ntohs(eth->h_proto);
+    void *ip_header = eth + 1;
+
+    struct ipv6hdr *ip6 = NULL;
+    struct udphdr *udp = NULL;
+    void *udp_payload = NULL;
+
+    if (eth_type == ETH_P_IPV6) {
+        ip6 = ip_header;
+        if ((void *)(ip6 + 1) > data_end)
+            return XDP_PASS;
+
+        if (ip6->nexthdr != IPPROTO_UDP)
+            return XDP_PASS;
+
+        udp = (struct udphdr *)(ip6 + 1);
+    } else {
+        return XDP_PASS;
+    }
+
+    if ((void *)(udp + 1) > data_end)
+        return XDP_PASS;
+
+    // Get UDP payload (RoCEv2 BTH starts here)
+    udp_payload = (void *)(udp + 1);
+    if ((void *)(udp_payload + 1) > data_end)
+        return XDP_PASS;
+
+    __u8 opcode = *((__u8 *)udp_payload); // First byte of BTH
+    if (opcode == 0x81) { // Check if it's a CNP packet
+        bpf_printk("Detected RoCE CNP Packet (Opcode 0x81)\n");
+
+        // Get current timestamp
+        __u64 now_ns = bpf_ktime_get_ns();
+        __u32 key = 0;
+        struct cnp_data *entry = bpf_map_lookup_elem(&cnp_counter, &key);
+
+        if (entry) {
+            // Check time difference
+            if (now_ns - entry->last_time <= TIME_INTERVAL_NS) {
+                __sync_fetch_and_add(&entry->count, 1); // Increment counter
+                entry->last_time = now_ns; // Update timestamp
+
+                if (entry->count == 3) {
+                    bpf_printk("Change path triggered due to 3 CNPs in interval!\n");
+
+                    // Reset counter
+                    struct cnp_data reset_entry = {
+                        .count = 0,
+                        .last_time = now_ns
+                    };
+                    bpf_map_update_elem(&cnp_counter, &key, &reset_entry, BPF_ANY);
+                }
+            } else {
+                // Reset counter if time has exceeded
+                struct cnp_data new_entry = {
+                    .count = 1,
+                    .last_time = now_ns
+                };
+                bpf_map_update_elem(&cnp_counter, &key, &new_entry, BPF_ANY);
+            }
+        } else {
+            // Initialize the entry if it doesn't exist
+            struct cnp_data new_entry = {
+                .count = 1,
+                .last_time = now_ns
+            };
+            bpf_map_update_elem(&cnp_counter, &key, &new_entry, BPF_ANY);
+        }
+    }
+
+    return XDP_PASS;
+}
+
+char _license[] SEC("license") = "GPL";
+
