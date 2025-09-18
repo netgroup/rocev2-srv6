@@ -61,7 +61,11 @@ struct{
 }local_qps SEC(".maps");*/
 
 
-
+struct { __uint(type, BPF_MAP_TYPE_ARRAY); 
+	__uint(max_entries, 1); 
+	__type(key, __u32);
+	__type(value, __be32); 
+}impacted_qp SEC(".maps");
 
 struct qp_pair {
     __be32 local_qp;
@@ -147,8 +151,8 @@ struct qp_stats {
 };
 
 #define QP_STATS_MAX        4096
-#define BASE_THRESHOLD_BPS  (10000000000ULL)   // 10 Gbps
-#define BELOW_TARGET_NS     (1000000ULL)   // 1 ms
+#define BASE_THRESHOLD_BPS  (2000000000ULL)   // 2 Gbps
+#define BELOW_TARGET_NS     (10000000ULL)   // 10 ms
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -314,7 +318,8 @@ static __always_inline void qp_update_throughput_and_maybe_reroute(struct xdp_md
 
 		st->bytes    = 0;
 		st->start_ns = now;
-	}else{bpf_printk("No remote QP retrieved");}
+	}else{//bpf_printk("No remote QP retrieved");
+		}
 }
 
 
@@ -345,9 +350,23 @@ struct sr6_encap_red_info *encap_policy_lookup_ip4_qp(struct xdp_md *ctx,
             
             struct sr6_encap_red_info *v = bpf_map_lookup_elem(&sr6encap_ip4_qp_table, &k);
             if (v) {
-            /*   bpf_printk("entry found: dst=%pI4 qpn=0x%06x (%u)\n",
-                           &ip4h->daddr, dqpn & 0xFFFFFF, dqpn);*/
-               return v;
+				// Logica DSCP per match QP
+				__u32 key0 = 0;
+				__u32 *stored_qp = bpf_map_lookup_elem(&impacted_qp, &key0);
+
+				if (!stored_qp || *stored_qp == 0) {
+					// Salva il primo QP osservato
+					bpf_map_update_elem(&impacted_qp, &key0, &dqpn, BPF_ANY);
+				} else if (*stored_qp == dqpn) {
+					// Match → cambia DSCP (CS1 = 8)
+					struct iphdr *iph = (struct iphdr *)ip4h;
+					__u8 new_dscp = 8 << 2;   // DSCP CS1
+					__u8 mask     = 0xFC;     // preserva i 2 bit ECN
+					iph->tos = (iph->tos & ~mask) | new_dscp;
+					bpf_printk("DSCP changed for QP=0x%x", dqpn);
+				}
+				return v;
+        
            }
       } else {
            // __push(cur, sizeof(*udph));
@@ -768,8 +787,16 @@ int do_srh_encap_red_ip4_core(struct xdp_md *ctx, struct hdr_cursor *cur,
 	 */
 	
 	if (ip4h->protocol == IPPROTO_TCP) {
+		__u32 key=0;
+		__be32 val=0;	
+		bpf_map_update_elem(&impacted_qp, &key, &val,BPF_ANY);
     	get_local_qp(ctx, cur);
 	}
+
+
+	
+
+
 
 	rc = cur_xdp_expand_head(ctx, cur, encap_len);
 	if (unlikely(rc))
@@ -895,7 +922,8 @@ int process_decap_ip4(struct xdp_md *ctx, struct hdr_cursor *cur, __u8 tclass,
 	
 	*/
 	if(nexthdr==IPPROTO_TCP){
-			get_remote_qp(ctx,cur);
+		get_remote_qp(ctx,cur);
+
 	}else if (nexthdr == IPPROTO_UDP) {
 			
 
@@ -1069,3 +1097,4 @@ int xdp_pass(struct xdp_md *ctx)
 }
 
 char _license[] SEC("license") = "GPL";
+
