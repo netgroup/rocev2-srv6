@@ -48,15 +48,55 @@ struct remote_info{
 };
 
 #define INFO_MAX_ASSOC	256
-struct{
-	__uint(type, BPF_MAP_TYPE_HASH);
+/*struct{
+	__uint(type, BPF_MAP_TYPE_QUEUE);
 	__uint(max_entries, INFO_MAX_ASSOC);
-	__type(key, struct remote_info);
+	__type(value, struct remote_info);
+}remote_qps SEC(".maps");
+
+struct{
+	__uint(type, BPF_MAP_TYPE_QUEUE);
+	__uint(max_entries, INFO_MAX_ASSOC);
 	__type(value, struct local_info);
+}local_qps SEC(".maps");*/
 
-}local_remote_assoc SEC(".maps");
 
 
+
+struct qp_pair {
+    __be32 local_qp;
+    __be32 remote_qp;
+};
+
+#define INFO_MAX_ASSOC 256
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, INFO_MAX_ASSOC);
+    __type(key, __u32);              // seq number (o ack number)
+    __type(value, struct qp_pair);
+} seq_qp_assoc SEC(".maps");
+
+// Coda per i locali in attesa
+struct {
+    __uint(type, BPF_MAP_TYPE_QUEUE);
+    __uint(max_entries, 256);
+    __type(value, __be32);   // solo local_qp
+} pending_locals SEC(".maps");
+
+// Coda per i remoti in attesa
+struct {
+    __uint(type, BPF_MAP_TYPE_QUEUE);
+    __uint(max_entries, 256);
+    __type(value, __be32);   // solo remote_qp
+} pending_remotes SEC(".maps");
+
+struct{
+	__uint(type,BPF_MAP_TYPE_HASH);
+	__uint(max_entries, INFO_MAX_ASSOC);
+	__type(key, struct local_info);
+	__type(value, struct remote_info);
+}local_remote_association SEC(".maps");
 
 #define SR6_ENCAP_RED_HEADROOM sizeof(struct ipv6hdr)
 
@@ -129,7 +169,7 @@ static __always_inline bool rocev2_extract_qpn(void *bth, void *data_end, __u32 
     raw32 = ((__u32)p[5] << 16) | ((__u32)p[6] << 8) | (__u32)p[7];
     // bpf_printk("BTH[5..7]= %02x %02x %02x  raw32=0x%x\n",
     //               p[5], p[6], p[7], raw32);
-    *qpn_out =raw32;
+    *qpn_out =bpf_htonl(raw32);
     return true;
 }
 
@@ -163,76 +203,11 @@ __be32 parse_ascii_to_be32(const char *ascii)
 }
 
 
-static __always_inline
-int get_remote_qp(struct xdp_md *ctx, struct hdr_cursor *cur)
-{
-    void *data_end = (void *)(long)ctx->data_end;
-
-    /* tcph all’inizio del trasporto: usa cur->thoff e non toccare cur->pos */
-    struct tcphdr *tcph = (struct tcphdr *)cur_header_pointer(ctx, cur->thoff, sizeof(*tcph));
-    if (!tcph)
-        return -1;
-
-    __u32 thlen = (__u32)tcph->doff << 2;
-    if (thlen < sizeof(*tcph))
-        return -1;
-
-    /* Puntatore al payload TCP: vogliamo almeno 16 byte per leggere DATA[15] */
-    unsigned char *payload = (unsigned char *)cur_header_pointer(ctx, cur->thoff + thlen, 16);
-    if (!payload)
-        return -1;
-
-    char ascii[7] = {0};
-#pragma clang loop unroll(full)
-    for (int i = 0; i < 6; i++) {
-        ascii[i] = payload[10 + i];
-    }
-    ascii[6] = '\0';
-
-    bpf_printk("REMOTE QP: ASCII DATA[10..15] = %s\n", ascii);
-	bpf_printk("be32:  0x%x",parse_ascii_to_be32(ascii));
-
-    return 0;
-}
-
-
-int get_local_qp(struct xdp_md *ctx, struct hdr_cursor *cur)
-{
-    void *data_end = (void *)(long)ctx->data_end;
-
-    /* tcph all’inizio del trasporto: usa cur->thoff e non toccare cur->pos */
-    struct tcphdr *tcph = (struct tcphdr *)cur_header_pointer(ctx, cur->thoff, sizeof(*tcph));
-    if (!tcph)
-        return -1;
-
-    __u32 thlen = (__u32)tcph->doff << 2;
-    if (thlen < sizeof(*tcph))
-        return -1;
-
-    /* Puntatore al payload TCP: vogliamo almeno 16 byte per leggere DATA[15] */
-    unsigned char *payload = (unsigned char *)cur_header_pointer(ctx, cur->thoff + thlen, 16);
-    if (!payload)
-        return -1;
-
-    char ascii[7] = {0};
-#pragma clang loop unroll(full)
-    for (int i = 0; i < 6; i++) {
-        ascii[i] = payload[10 + i];
-    }
-    ascii[6] = '\0';
-
-    bpf_printk("LOCAL QP: ASCII DATA[10..15] = %s\n", ascii);
-    return 0;
-}
-
-
-
-
 // Aggiorna o toggla la policy per (dst_ip, qpn).
 // Se non esiste entry per-QP, prende tunsrc/sid dal fallback per-dest.
 static __always_inline void flip_route_for_ip_qp(__be32 dst_ip_n, __u32 dqpn)
 {
-   // bpf_printk("flipping route");
+    bpf_printk("flipping route");
     struct encap_qp_key k = { .dst_ip = bpf_ntohl(dst_ip_n), .qpn =dqpn};
    // bpf_printk("address in the key 0x%x", k.dst_ip);
    // bpf_printk("qpn in the key 0x%x", k.qpn);
@@ -254,26 +229,7 @@ static __always_inline void flip_route_for_ip_qp(__be32 dst_ip_n, __u32 dqpn)
         bpf_map_update_elem(&sr6encap_ip4_qp_table, &k, &newv, BPF_ANY);
         return;
     }
-  /*
-  //entry per QP dovrebbe già esser stata inizializzata
-    // Nessuna entry per-QP: prendi fallback per-dest come base
-    __u32 dst_host = bpf_ntohl(dst_ip_n);
-    struct sr6_encap_red_info *fallback = bpf_map_lookup_elem(&sr6encap_ip4_table, &dst_host);
-    if (fallback) {
-        base = *fallback;
-    } else {
-        
-        __builtin_memcpy(&base.tunsrc, &TUN_SRC, sizeof(base.tunsrc));
-        __builtin_memcpy(&base.sid, &PRIMARY_SID, sizeof(base.sid));
-    }
-
-   
-    if (__builtin_memcmp(&base.sid, &PRIMARY_SID, sizeof(PRIMARY_SID)) == 0)
-        __builtin_memcpy(&base.sid, &SECONDARY_SID, sizeof(base.sid));
-    else
-        __builtin_memcpy(&base.sid, &PRIMARY_SID, sizeof(base.sid));
-
-    bpf_map_update_elem(&sr6encap_ip4_qp_table, &k, &base, BPF_ANY);*/
+  
 }
 
 
@@ -285,87 +241,80 @@ static __always_inline void qp_update_throughput_and_maybe_reroute(struct xdp_md
 {
     void *data_end = (void *)(long)ctx->data_end;
     void *bth      = cur_data(ctx, cur);
-    __u32 qpn;
-    if (!rocev2_extract_qpn(bth, data_end, &qpn))
+    __be32 local_qpn;
+    if (!rocev2_extract_qpn(bth, data_end, &local_qpn))	//this is the local QP number
         return;
+	struct local_info loc_info;
+	loc_info.local_qp=local_qpn;
+	
+	struct remote_info *rem_info;
+	rem_info=bpf_map_lookup_elem(&local_remote_association,&loc_info);
+	if(rem_info){
+		__u64 now   = bpf_ktime_get_ns();
+		__u64 bytes = (udp_len >= 8) ? (udp_len - 8) : 0;
 
-    __u64 now   = bpf_ktime_get_ns();
-    __u64 bytes = (udp_len >= 8) ? (udp_len - 8) : 0;
+		/* --- se non c’è ancora entry per-QP, copia quella per-dest se esiste --- */
+		struct encap_qp_key k = { .dst_ip = bpf_ntohl(ip4h->saddr), .qpn =rem_info->remote_qp};
+       
+		struct sr6_encap_red_info *curv = bpf_map_lookup_elem(&sr6encap_ip4_qp_table, &k);
+		if(curv){
+			const __u8 *ts = curv->tunsrc.in6_u.u6_addr8;
+			const __u8 *sd = curv->sid.in6_u.u6_addr8;
+		}    
+				
+				
+		if (!curv) {
+		//   bpf_printk("Entry not found");
+			struct sr6_encap_red_info init = {0,};
 
-    /* --- se non c’è ancora entry per-QP, copia quella per-dest se esiste --- */
-    struct encap_qp_key k = { .dst_ip = bpf_ntohl(ip4h->saddr), .qpn =qpn};
- //   bpf_printk("qpn in the key 0x%x", k.qpn);
-    
-    struct sr6_encap_red_info *curv = bpf_map_lookup_elem(&sr6encap_ip4_qp_table, &k);
-    if(curv){
-        const __u8 *ts = curv->tunsrc.in6_u.u6_addr8;
-        const __u8 *sd = curv->sid.in6_u.u6_addr8;
-        
-       /* bpf_printk("tunsrc = %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                   ts[0], ts[1], ts[2], ts[3], ts[4], ts[5], ts[6], ts[7]);
-        bpf_printk("         %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                   ts[8], ts[9], ts[10], ts[11], ts[12], ts[13], ts[14], ts[15]);
+			__u32 dst_host = bpf_ntohl(ip4h->saddr);
+			struct sr6_encap_red_info *fallback = bpf_map_lookup_elem(&sr6encap_ip4_table, &dst_host);
 
-        bpf_printk("sid    = %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                   sd[0], sd[1], sd[2], sd[3], sd[4], sd[5], sd[6], sd[7]);
-        bpf_printk("         %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                   sd[8], sd[9], sd[10], sd[11], sd[12], sd[13], sd[14], sd[15]);*/
-    }    
-               
-               
-    if (!curv) {
-     //   bpf_printk("Entry not found");
-        struct sr6_encap_red_info init = {0,};
+			if (fallback) {
+				/* copia direttamente la policy di fallback */
+				init = *fallback;
+			} else {
+				/* nessuna entry nemmeno per-dest: usa un default */
+				__builtin_memcpy(&init.tunsrc, &TUN_SRC, sizeof(TUN_SRC));
+				__builtin_memcpy(&init.sid, &PRIMARY_SID, sizeof(PRIMARY_SID));
+			}
 
-        __u32 dst_host = bpf_ntohl(ip4h->saddr);
-        struct sr6_encap_red_info *fallback = bpf_map_lookup_elem(&sr6encap_ip4_table, &dst_host);
+			bpf_map_update_elem(&sr6encap_ip4_qp_table, &k, &init, BPF_ANY); 
+		
+		}
 
-        if (fallback) {
-            /* copia direttamente la policy di fallback */
-            init = *fallback;
-        } else {
-            /* nessuna entry nemmeno per-dest: usa un default */
-            __builtin_memcpy(&init.tunsrc, &TUN_SRC, sizeof(TUN_SRC));
-            __builtin_memcpy(&init.sid, &PRIMARY_SID, sizeof(PRIMARY_SID));
-        }
+		/* --- update throughput --- */
+	
+		struct qp_stats *st = bpf_map_lookup_elem(&qp_throughput, &rem_info->remote_qp);
+		if (!st) {
+			struct qp_stats init_st = {.bytes=bytes, .start_ns=now, .last_ns=now};
+			bpf_map_update_elem(&qp_throughput, &rem_info->remote_qp, &init_st, BPF_ANY);
+			return;
+		}
 
-        bpf_map_update_elem(&sr6encap_ip4_qp_table, &k, &init, BPF_ANY); 
-    //    bpf_printk("QP init: dst=%x qpn=0x%x (da fallback? %s)\n",
-      //             bpf_ntohl(ip4h->saddr),qpn,
-        //           fallback ? "YES" : "DEFAULT");
-    }
+		st->bytes  += bytes;
+		st->last_ns = now;
 
-    /* --- update throughput --- */
-   
-    struct qp_stats *st = bpf_map_lookup_elem(&qp_throughput, &qpn);
-    if (!st) {
-        struct qp_stats init_st = {.bytes=bytes, .start_ns=now, .last_ns=now};
-        bpf_map_update_elem(&qp_throughput, &qpn, &init_st, BPF_ANY);
-        return;
-    }
+		__u64 dt = now - st->start_ns;
+	
 
-    st->bytes  += bytes;
-    st->last_ns = now;
+		__u64 bps = st->bytes ? (st->bytes * 8ULL * 1000000000ULL) / dt : 0;
+		st->last_bps = bps;
+	   // bpf_printk("throughput: %ld", st->last_bps);
+		if (bps < BASE_THRESHOLD_BPS) {
+			st->below_ns_accum += dt;
+			if (st->below_ns_accum >= BELOW_TARGET_NS) {
+				/* flip della rotta solo dopo soglia */
+				flip_route_for_ip_qp(ip4h->saddr, rem_info->remote_qp);
+				st->below_ns_accum = 0;
+			}
+		} else {
+			st->below_ns_accum = 0;
+		}
 
-    __u64 dt = now - st->start_ns;
-  
-
-    __u64 bps = st->bytes ? (st->bytes * 8ULL * 1000000000ULL) / dt : 0;
-    st->last_bps = bps;
-  //  bpf_printk("throughput: %ld", st->last_bps);
-    if (bps < BASE_THRESHOLD_BPS) {
-        st->below_ns_accum += dt;
-        if (st->below_ns_accum >= BELOW_TARGET_NS) {
-            /* flip della rotta solo dopo soglia */
-            flip_route_for_ip_qp(ip4h->saddr,  qpn);
-            st->below_ns_accum = 0;
-        }
-    } else {
-        st->below_ns_accum = 0;
-    }
-
-    st->bytes    = 0;
-    st->start_ns = now;
+		st->bytes    = 0;
+		st->start_ns = now;
+	}else{bpf_printk("No remote QP retrieved");}
 }
 
 
@@ -402,9 +351,9 @@ struct sr6_encap_red_info *encap_policy_lookup_ip4_qp(struct xdp_md *ctx,
            }
       } else {
            // __push(cur, sizeof(*udph));
-           /*fallback per-dest */
+           /* non sembra un BTH valido → fallback per-dest */
+		   bpf_printk("fallback");
             return encap_policy_lookup_ip4(ip4h);
-
         }
   }
 
@@ -704,6 +653,77 @@ int build_ipv6hdr(struct xdp_md *ctx, struct hdr_cursor *cur,
 	return 0;
 }
 
+static __always_inline
+int get_local_qp(struct xdp_md *ctx, struct hdr_cursor *cur)
+{
+    struct tcphdr *tcph = cur_header_pointer(ctx, cur->thoff, sizeof(*tcph));
+    if (!tcph) return -1;
+
+    __u32 thlen = tcph->doff << 2;
+    if (thlen < sizeof(*tcph)) return -1;
+
+    unsigned char *payload = cur_header_pointer(ctx, cur->thoff + thlen, 16);
+    if (!payload) return -1;
+
+    char ascii[7] = {};
+#pragma clang loop unroll(full)
+    for (int i = 0; i < 6; i++)
+        ascii[i] = payload[10 + i];
+
+    __be32 local_qp = parse_ascii_to_be32(ascii);
+    bpf_printk("LOCAL QP (parsed): 0x%x", local_qp);
+
+    __be32 remote_qp;
+    if (bpf_map_pop_elem(&pending_remotes, &remote_qp) == 0) {
+        // Abbiamo già un remote in attesa → accoppia subito
+        struct local_info loc = { .local_qp = local_qp };
+        struct remote_info rem = { .remote_qp = remote_qp };
+        bpf_map_update_elem(&local_remote_association, &loc, &rem, BPF_ANY);
+        bpf_printk("ASSOCIATED (local first): local=0x%x remote=0x%x",
+                   loc.local_qp, rem.remote_qp);
+    } else {
+        // Nessun remote → accoda il local
+        bpf_map_push_elem(&pending_locals, &local_qp, BPF_ANY);
+        bpf_printk("PENDING local=0x%x", local_qp);
+    }
+    return 0;
+}
+static __always_inline
+int get_remote_qp(struct xdp_md *ctx, struct hdr_cursor *cur)
+{
+    struct tcphdr *tcph = cur_header_pointer(ctx, cur->thoff, sizeof(*tcph));
+    if (!tcph) return -1;
+
+    __u32 thlen = tcph->doff << 2;
+    if (thlen < sizeof(*tcph)) return -1;
+
+    unsigned char *payload = cur_header_pointer(ctx, cur->thoff + thlen, 16);
+    if (!payload) return -1;
+
+    char ascii[7] = {};
+#pragma clang loop unroll(full)
+    for (int i = 0; i < 6; i++)
+        ascii[i] = payload[10 + i];
+
+    __be32 remote_qp = parse_ascii_to_be32(ascii);
+    bpf_printk("REMOTE QP (parsed): 0x%x", remote_qp);
+
+    __be32 local_qp;
+    if (bpf_map_pop_elem(&pending_locals, &local_qp) == 0) {
+        // Abbiamo già un local in attesa → accoppia subito
+        struct local_info loc = { .local_qp = local_qp };
+        struct remote_info rem = { .remote_qp = remote_qp };
+        bpf_map_update_elem(&local_remote_association, &loc, &rem, BPF_ANY);
+        bpf_printk("ASSOCIATED (remote first): local=0x%x remote=0x%x",
+                   loc.local_qp, rem.remote_qp);
+    } else {
+        // Nessun local → accoda il remote
+        bpf_map_push_elem(&pending_remotes, &remote_qp, BPF_ANY);
+        bpf_printk("PENDING remote=0x%x", remote_qp);
+    }
+    return 0;
+}
+
 /* NOTE: ATM we support only 1 sid in the encap policy */
 static __always_inline
 int do_srh_encap_red_ip4_core(struct xdp_md *ctx, struct hdr_cursor *cur,
@@ -740,13 +760,17 @@ int do_srh_encap_red_ip4_core(struct xdp_md *ctx, struct hdr_cursor *cur,
 	payload_info.payload_len = bpf_ntohs(ip4h->tot_len);
 	payload_info.nexthdr = IPPROTO_IPIP;
 	payload_info.tos = ip4h->tos;
-	bpf_printk("tos field: %u", ip4h->tos);
 
 	payload_info.encap_info = einfo;
 
 	/* expand the xdp frame. Note that xdp frame pointers will be
 	 * invalidated after this operation.
 	 */
+	
+	if (ip4h->protocol == IPPROTO_TCP) {
+    	get_local_qp(ctx, cur);
+	}
+
 	rc = cur_xdp_expand_head(ctx, cur, encap_len);
 	if (unlikely(rc))
 		goto abort;
@@ -763,8 +787,9 @@ int do_srh_encap_red_ip4_core(struct xdp_md *ctx, struct hdr_cursor *cur,
 	rc = build_ipv6hdr(ctx, cur, &payload_info);
 	if (unlikely(rc))
 		goto abort;
+		
 
-	/* forward the packet doing routing lookup */
+ 	/* forward the packet doing routing lookup */
 	return ip6_packet_forward(ctx, cur, &res);
 
 abort:
@@ -871,8 +896,9 @@ int process_decap_ip4(struct xdp_md *ctx, struct hdr_cursor *cur, __u8 tclass,
 	*/
 	if(nexthdr==IPPROTO_TCP){
 			get_remote_qp(ctx,cur);
-
 	}else if (nexthdr == IPPROTO_UDP) {
+			
+
             struct udphdr *udph = (void *)cur_header_pointer(ctx, cur->thoff, sizeof(*udph));
             if (udph && bpf_ntohs(udph->dest) == 4791 /* RoCEv2 */) {
 
@@ -887,7 +913,7 @@ int process_decap_ip4(struct xdp_md *ctx, struct hdr_cursor *cur, __u8 tclass,
                 } else {
                     bpf_printk("RoCEv2: UDP too short (%u)\n", udp_len);
                 }
-    }
+    		}
 	}
 
 
@@ -1043,5 +1069,3 @@ int xdp_pass(struct xdp_md *ctx)
 }
 
 char _license[] SEC("license") = "GPL";
-
-
