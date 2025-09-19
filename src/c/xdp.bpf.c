@@ -151,8 +151,12 @@ struct qp_stats {
 };
 
 #define QP_STATS_MAX        4096
-#define BASE_THRESHOLD_BPS  (2000000000ULL)   // 2 Gbps
-#define BELOW_TARGET_NS     (10000000ULL)   // 10 ms
+#define Mbps(x) ((x) * 1000000ULL)
+#define Gbps(x) ((x) * 1000000000ULL)
+#define ms(x) ((x)*1000000ULL)
+#define BASE_THRESHOLD_BPS Mbps(100)  // 100 Mbps
+
+#define BELOW_TARGET_NS ms(200)   // 200 ms
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -245,6 +249,17 @@ static __always_inline void qp_update_throughput_and_maybe_reroute(struct xdp_md
 {
     void *data_end = (void *)(long)ctx->data_end;
     void *bth      = cur_data(ctx, cur);
+	__u8 *bth_bytes = (__u8 *)bth;
+	if ((void *)(bth_bytes + 1) > data_end)
+		return;
+
+	__u8 opcode = bth_bytes[0] & 0x7F;  // maschera i 7 bit bassi
+
+	//bpf_printk("opcode: 0x%x", opcode);
+	if(opcode==0x11 || opcode==0x81){
+		//bpf_printk("ACK");
+		return;
+	}
     __be32 local_qpn;
     if (!rocev2_extract_qpn(bth, data_end, &local_qpn))	//this is the local QP number
         return;
@@ -299,7 +314,7 @@ static __always_inline void qp_update_throughput_and_maybe_reroute(struct xdp_md
 		st->bytes  += bytes;
 		st->last_ns = now;
 
-		__u64 dt = now - st->start_ns;
+		__u64 dt = now - st->start_ns; //nanosecond
 	
 
 		__u64 bps = st->bytes ? (st->bytes * 8ULL * 1000000000ULL) / dt : 0;
@@ -309,6 +324,7 @@ static __always_inline void qp_update_throughput_and_maybe_reroute(struct xdp_md
 			st->below_ns_accum += dt;
 			if (st->below_ns_accum >= BELOW_TARGET_NS) {
 				/* flip della rotta solo dopo soglia */
+				bpf_printk("bps %u for qp 0x%x", bps, &rem_info->remote_qp);
 				flip_route_for_ip_qp(ip4h->saddr, rem_info->remote_qp);
 				st->below_ns_accum = 0;
 			}
@@ -360,10 +376,11 @@ struct sr6_encap_red_info *encap_policy_lookup_ip4_qp(struct xdp_md *ctx,
 				} else if (*stored_qp == dqpn) {
 					// Match → cambia DSCP (CS1 = 8)
 					struct iphdr *iph = (struct iphdr *)ip4h;
-					__u8 new_dscp = 8 << 2;   // DSCP CS1
+					__u8 new_dscp = 50 << 2;   // DSCP CS1
 					__u8 mask     = 0xFC;     // preserva i 2 bit ECN
 					iph->tos = (iph->tos & ~mask) | new_dscp;
-					bpf_printk("DSCP changed for QP=0x%x", dqpn);
+					// //bpf_printk("DSCP changed for QP=0x%x", dqpn);
+					
 				}
 				return v;
         
@@ -789,7 +806,7 @@ int do_srh_encap_red_ip4_core(struct xdp_md *ctx, struct hdr_cursor *cur,
 	if (ip4h->protocol == IPPROTO_TCP) {
 		__u32 key=0;
 		__be32 val=0;	
-		bpf_map_update_elem(&impacted_qp, &key, &val,BPF_ANY);
+		bpf_map_update_elem(&impacted_qp, &key, &val, BPF_ANY);
     	get_local_qp(ctx, cur);
 	}
 
@@ -934,7 +951,7 @@ int process_decap_ip4(struct xdp_md *ctx, struct hdr_cursor *cur, __u8 tclass,
                 if (udp_len >= 8 + 12) { // header UDP (8) + 12 byte minimi di BTH
                     /* Sposta il cursore all’inizio del BTH */
                     cur_pull(ctx, cur, sizeof(*udph));
-
+					
                     /* Misura throughput per-QP + eventuale flip SID dopo 200ms < 0.5Gbps */
                     qp_update_throughput_and_maybe_reroute(ctx, cur, ip4h, udp_len);
 
@@ -945,7 +962,6 @@ int process_decap_ip4(struct xdp_md *ctx, struct hdr_cursor *cur, __u8 tclass,
 	}
 
 
-        // aggiorna DSCP/ECT dal tclass e fai forward
         ipv4_change_dsfield(ip4h, 0xff, tclass);
         return ip4_packet_forward(ctx, cur, &res);
 
