@@ -27,7 +27,7 @@ disable_checksum_offload()
 # Interface mapping based on dynamic veth pair naming
 VETH_GW2_RT1="veth-gw2-rt1"
 VETH_GW2_RT2="veth-gw2-rt2"
-BF_PORT="ens10np1"
+BF_PORT="ens9np1"
 
 disable_checksum_offload ${VETH_GW2_RT1}
 disable_checksum_offload ${VETH_GW2_RT2}

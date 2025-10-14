@@ -27,7 +27,7 @@ disable_checksum_offload()
 # Interface mapping based on dynamic veth pair naming
 VETH_GW1_RT1="veth-gw1-rt1"
 VETH_GW1_RT2="veth-gw1-rt2"
-BF_PORT="ens9np0"
+BF_PORT="ens11np0"
 
 disable_checksum_offload ${VETH_GW1_RT1}
 disable_checksum_offload ${VETH_GW1_RT2}
@@ -101,6 +101,5 @@ ${BPFTOOL} \
 	pinned "${BPFFS_PATH}/maps/sr6encap_ip4_table"			\
 	key hex         01 02 37 0a                                     \
 	value hex       fd 00 00 a1 00 b0 00 00 00 00 00 00 00 00 00 01 \
-			fc f0 00 00 00 b1 00 0e 00 a2 00 d4 00 00 00 00
-
+					fc f0 00 00 00 a1 00 0e 00 a2 00 d4 00 00 00 00
 /bin/bash

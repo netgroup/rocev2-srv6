@@ -1,0 +1,19 @@
+echo "[+] Populating xdp_route_map..."
+
+# Verifica l'ifindex reale del veth (es: ip link show veth-gw2-gw1)
+IFINDEX=$(cat /sys/class/net/veth-gw2-gw1/ifindex)
+
+# Prima entry — primary SID
+${BPFTOOL} map update pinned /sys/fs/bpf/maps/xdp_route_map \
+    key hex fc f0 00 00 00 b1 00 0e 00 a1 00 d4 00 00 00 00 \
+    value hex $(printf "%08x" $IFINDEX | sed 's/../& /g') \
+        02 aa bb cc 22 00 \
+        02 aa bb cc 11 00
+
+# Second entry — secondary SID
+${BPFTOOL} map update pinned /sys/fs/bpf/maps/xdp_route_map \
+    key hex fc f0 00 00 00 b2 00 0e 00 a1 00 d4 00 00 00 00 \
+    value hex $(printf "%08x" $IFINDEX | sed 's/../& /g') \
+        02 aa bb cc 22 00 \
+        02 aa bb cc 11 00
+
