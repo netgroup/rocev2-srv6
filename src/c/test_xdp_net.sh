@@ -76,16 +76,18 @@ ${BPFTOOL} \
 	key hex			fc f0 00 00 00 a2 00 d4 00 00 00 00 00 00 00 00 \
 	value hex		b8 ce f6 1b 4d 5d \
 					b8 ce f6 1b 4c c1 \
-	           		06 00 00 00
+	           		04 00 00 00
 
 ${BPFTOOL} \
 	map update pinned /sys/fs/bpf/maps/mac_fwd_v4_map \
     key hex 	01 02 37 0a \
     value hex 	b8 ce f6 1b 4d 5d \
-			  	b8 ce f6 1b 4c c1 \
-			  	06 00 00 00
+				b8 ce f6 1b 4c c1 \
+	           	04 00 00 00
 
 
+
+ 
 
 ###################
 ##### RECEIVER ####
@@ -128,8 +130,8 @@ ${BPFTOOL} \
 	pinned "${BPFFS_PATH}/maps/mac_fwd_map" \
 	key hex				fc f0 00 00 00 a1 00 d4 00 00 00 00 00 00 00 00 \
 	value hex			b8 ce f6 1b 4d 5c \
-	        			b8 ce f6 1b 4c c0 \
-	           			07 00 00 00
+						b8 ce f6 1b 4c c0 \
+						05 00 00 00
 
 
 
@@ -138,4 +140,7 @@ ${BPFTOOL} \
     key hex 	01 01 37 0a \
     value hex 	b8 ce f6 1b 4d 5c \
 	        	b8 ce f6 1b 4c c0 \
-			  	07 00 00 00
+			  	05 00 00 00
+
+
+#!/bin/bash
