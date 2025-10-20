@@ -7,7 +7,7 @@
 #include "parse_helpers.h"
 
 
-#define PRINT_LEVEL 4
+#define PRINT_LEVEL 0
 #define IFINDEX_ENS11NP0 5
 #define IFINDEX_ENS9NP1 4
 
@@ -123,7 +123,7 @@ struct {
 #define Gbps(x) ((x) * 1000000000ULL)
 #define ms(x) ((x)*1000000ULL)
 #define NSEC_PER_SEC 1000000000ULL
-#define BASE_THRESHOLD_BPS 1000000ULL  // 1 Mbps
+#define BASE_THRESHOLD_BPS Gbps(1)
 
 #define BELOW_TARGET_NS ms(200)   // 200 ms
 
@@ -184,25 +184,33 @@ static __always_inline void qp_idle_cleanup(__u64 now_ns)
         pr_warn("Cleaned up impacted QP 0x%x after inactivity", *qp);
     }
 }
+
+
 static __always_inline 
-int prepare_metadata(struct xdp_md *ctx)
+bool prepare_metadata(struct xdp_md *ctx)
 {
-    void *data     = (void *)(long)ctx->data;
+    void *data = (void *)(long)ctx->data;
+    void *data_meta;
+    int size = sizeof(struct meta);
 
-    int need = -(int)sizeof(struct meta);
-    if (bpf_xdp_adjust_meta(ctx, need) < 0)
-        return XDP_ABORTED;
+    /* Sposta indietro data_meta di "size" byte */
+    if (bpf_xdp_adjust_meta(ctx, -size) < 0)
+        return false;
 
-    /* Recompute pointers after adjust_meta */
-    void *data_meta = (void *)(long)ctx->data_meta;
+    /* Aggiorna i puntatori dopo l'aggiustamento */
+    data      = (void *)(long)ctx->data;
+    data_meta = (void *)(long)ctx->data_meta;
 
-    /* Bounds check: metadata must fit entirely before L2 header */
-    if (data_meta + sizeof(struct meta) > data)
-        return XDP_ABORTED;
+    /* Verifica di bounds: il metadata NON deve sovrapporsi ai dati */
+    if (data_meta + size > data)
+        return false;
 
-    return 1;
+    /* Inizializza la memoria per evitare "uninitialized stack" */
+    struct meta *md = data_meta;
+    __builtin_memset(md, 0, sizeof(*md));
+
+    return true;
 }
-
 
 
 /* === Dispatcher (attached at IFACE_A ingress) === */
@@ -340,7 +348,7 @@ static __always_inline void flip_route_for_qp(struct xdp_md *ctx){
         return;
     }
    
-    m->path_id = 0;
+   
     if(m->path_id==0){
        bpf_printk("flip route from 0 to 1");
         m->path_id = 1;
@@ -375,8 +383,8 @@ qp_update_throughput_and_maybe_reroute(struct xdp_md *ctx,
         return;
 
     __u64 now   = bpf_ktime_get_ns();
-    __u64 bytes = (udp_len >= 8) ? (udp_len - 8) : 0;
-
+    //__u64 bytes = (udp_len >= 8) ? (udp_len - 8) : 0;
+__u64 bytes = (__u64)((long)ctx->data_end - (long)ctx->data); // wire bytes
   
     // --- update throughput with 100ms window ---
     struct qp_stats *old_st =
@@ -384,6 +392,7 @@ qp_update_throughput_and_maybe_reroute(struct xdp_md *ctx,
 
     struct qp_stats st;
     if (!old_st) {
+        bpf_printk("init statistics for QP 0x%x", qpn);
         st.bytes          = bytes;
         st.start_ns       = now;
         st.last_ns        = now;
@@ -398,34 +407,37 @@ qp_update_throughput_and_maybe_reroute(struct xdp_md *ctx,
     }
 
     __u64 dt = now - st.start_ns;
+   // bpf_printk("start ns: %ld", st.start_ns);
 
     if (dt >= 100000000ULL) { // 100 ms
-        __u64 inst_bps = (st.bytes * 8ULL * 1000000000ULL) / dt;
+    __u64 inst_bps = (st.bytes * 8ULL * 1000000000ULL) / dt;
 
-        // α = 0.5 → average on 200 ms
-        const int alpha_num = 50;
-        const int alpha_den = 100;
+    // α = 0.5 → average su 200 ms
+    const int alpha_num = 50;
+    const int alpha_den = 100;
 
-        st.last_bps = (st.last_bps * (alpha_den - alpha_num) +
-                       inst_bps   * alpha_num) / alpha_den;
+    st.last_bps = (st.last_bps * (alpha_den - alpha_num) +
+                   inst_bps   * alpha_num) / alpha_den;
 
-        st.bytes    = 0;
-        st.start_ns = now;
-    }
-
-    // --- check threshold and route flip ---
+    // --- QUI: controllo sotto-soglia PRIMA di resettare start_ns ---
     if (st.last_bps < BASE_THRESHOLD_BPS) {
-        st.below_ns_accum += dt;
+        bpf_printk("thr: %llu", st.last_bps);      // %llu per u64
+        st.below_ns_accum += dt;                  // accumulo finestra temporale
+
         if (st.below_ns_accum >= BELOW_TARGET_NS) {
-           
             flip_route_for_qp(ctx);
-
-
-			st.below_ns_accum = 0;
+            st.below_ns_accum = 0;
         }
     } else {
         st.below_ns_accum = 0;
     }
+
+    // --- SOLO ORA resettiamo per la finestra successiva ---
+    st.bytes    = 0;
+    st.start_ns = now;
+}
+
+  
 
     bpf_map_update_elem(&qp_throughput, &qpn, &st, BPF_ANY);
 }
@@ -612,7 +624,7 @@ int xdp_fwd(struct xdp_md *ctx, struct hdr_cursor *cur,
             return XDP_PASS;
        
         /* stampa indirizzo di destinazione IPv4 */
-        __be32 ip4_key = bpf_htonl(ip4h->daddr);
+        ip4_key = bpf_htonl(ip4h->daddr);
 
         fwd = bpf_map_lookup_elem(&mac_fwd_v4_map, &ip4_key);
         //pr_warn("lookup performed\n");
@@ -633,13 +645,12 @@ int xdp_fwd(struct xdp_md *ctx, struct hdr_cursor *cur,
     __builtin_memcpy(eth->h_source, fwd->src_mac, ETH_ALEN);
     __builtin_memcpy(eth->h_dest, fwd->dst_mac, ETH_ALEN);
 
-    //Here the problem with attaching when print level 0
-    bpf_printk("xdp_fwd: modified MAC src=%02x:%02x:%02x:%02x:%02x:%02x dst=%02x:%02x:%02x:%02x:%02x:%02x",
+
+    pr_warn("xdp_fwd: modified MAC src=%02x:%02x:%02x:%02x:%02x:%02x dst=%02x:%02x:%02x:%02x:%02x:%02x",
             eth->h_source[0], eth->h_source[1], eth->h_source[2],
             eth->h_source[3], eth->h_source[4], eth->h_source[5],
             eth->h_dest[0], eth->h_dest[1], eth->h_dest[2],
             eth->h_dest[3], eth->h_dest[4], eth->h_dest[5]);
-
 
 
     if (proto == ETH_P_IPV6)
@@ -732,7 +743,6 @@ int do_srh_encap_red_ip4_core(struct xdp_md *ctx, struct hdr_cursor *cur,
         pr_warn("meta out of bounds");
         return XDP_ABORTED;
     }
-    m->path_id = 0;
 
     // automatic cleanup for onld QPs
     __u64 now = bpf_ktime_get_ns();
@@ -763,14 +773,19 @@ int do_srh_encap_red_ip4_core(struct xdp_md *ctx, struct hdr_cursor *cur,
 
                 __u32 key0 = 0;
                 __u32 *imp_qp = bpf_map_lookup_elem(&impacted_qp, &key0);
-                if (!imp_qp) {
+                if (!imp_qp || *imp_qp==0) {
                     bpf_map_update_elem(&impacted_qp, &key0, &remote_qp, BPF_ANY);
                 }
                 pr_warn("impacted qp: 0x%x", remote_qp);
 
                 __u32 *stored_qp = bpf_map_lookup_elem(&impacted_qp, &key0);
-                if (stored_qp && *stored_qp == remote_qp)
+                if (stored_qp){pr_warn("stored: 0x%x, remote: 0x%x", *stored_qp, remote_qp);
+                }
+                if (stored_qp && *stored_qp == remote_qp){
+                    pr_warn("detected impacted QP");
                     m->path_id = 1;
+                }
+                else{m->path_id=0;}
        
             }
         }
@@ -856,7 +871,7 @@ int xdp_sr6encap(struct xdp_md *ctx)
 	cur_init(cur);
 	cur_reset_mac_header(cur);
     
-    //Here the problem with attaching when print level 0
+    //Here the problem with attaching xdp program
     if (!prepare_metadata(ctx)) {
         bpf_printk("cannot prepare metadata");
         return XDP_ABORTED;
