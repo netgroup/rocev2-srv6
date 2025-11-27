@@ -1,0 +1,10 @@
+{"sysstat": {
+	"hosts": [
+		{
+			"nodename": "switch",
+			"sysname": "Linux",
+			"release": "6.8.0-87-generic",
+			"machine": "x86_64",
+			"number-of-cpus": 6,
+			"date": "11/20/2025",
+			"statistics": [
